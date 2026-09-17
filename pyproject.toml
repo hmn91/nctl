@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nctl"
+version = "2.0.0"
+description = "CLI scan management, DB backup, restore, task creation and monitoring"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31,<3"]
+
+[project.scripts]
+nctl = "nctl.app:main"
+
+[tool.setuptools.packages.find]
+include = ["nctl*"]
