@@ -138,10 +138,13 @@ kiểm tra scan trên máy chủ trước khi chạy lại vì có thể đã im
 Mặc định CHỈ CHUYỂN scan vào Trash; scan đã ở Trash được bỏ qua.
 --permanent XÓA VĨNH VIỄN scan/history, không thể khôi phục.
 --folder chọn theo ID/tên; folder custom bị xóa sau khi xử lý hết scan bên trong.
-Folder hệ thống My Scans/Trash được giữ lại. --all giữ các folder.
+Folder hệ thống My Scans/Trash được giữ lại. --all xóa cả folder custom đã rỗng.
+Folder còn scan (do lỗi hoặc scan mới xuất hiện) được giữ lại, báo lỗi.
 Delete --folder Trash không có --permanent sẽ không xóa dữ liệu.
-Luôn hiển thị cảnh báo và nhập lại mật khẩu đăng nhập trước khi thay đổi dữ liệu.
-Delete không hỗ trợ --non-interactive. Nên backup trước khi xóa vĩnh viễn.
+Luôn hiển thị cảnh báo. Chỉ --permanent yêu cầu nhập lại mật khẩu đăng nhập.
+Không --permanent: thực hiện ngay, không hỏi mật khẩu xác nhận; vẫn cần đăng nhập API.
+--non-interactive dùng được nếu không --permanent và có thông tin đăng nhập config/env.
+--permanent không hỗ trợ --non-interactive. Nên backup trước khi xóa vĩnh viễn.
 """,
     "task": """Ví dụ:
   .\\nctl.exe task create --targets targets.example.txt --name "Weekly servers"

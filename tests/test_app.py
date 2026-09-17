@@ -391,11 +391,13 @@ class AppTests(unittest.TestCase):
             scans=None,
             non_interactive=False,
             username=None,
+            permanent=True,
         )
         with patch("nctl.app.getpass.getpass", return_value="wrong"):
             with self.assertRaisesRegex(NctlError, "Invalid Credentials"):
                 cmd_delete(client, args, {"username": "admin"})
         client.delete_scan.assert_not_called()
+        client.move_scan.assert_not_called()
 
     def test_delete_default_moves_active_scans_and_skips_trash(self):
         client = Mock()

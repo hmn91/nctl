@@ -745,6 +745,10 @@ def cmd_delete(client: NctlClient, args: argparse.Namespace, config: dict[str, A
     custom_folder = bool(folder and str(folder.get("type", "")).casefold() == "custom")
     permanent = bool(getattr(args, "permanent", False))
     folders = client.list_folders()
+    folders_to_delete = (
+        [item for item in folders if str(item.get("type", "")).casefold() == "custom"]
+        if args.all else ([folder] if custom_folder else [])
+    )
     trash_folder_ids = _trash_folder_ids(folders)
     if len(trash_folder_ids) != 1:
         raise NctlError(
@@ -791,12 +795,20 @@ def cmd_delete(client: NctlClient, args: argparse.Namespace, config: dict[str, A
                 file=sys.stderr,
             )
 
-    if not actionable_scans and not custom_folder:
+    if args.all and folders_to_delete:
+        print(f"Sau đó sẽ xóa {len(folders_to_delete)} folder custom nếu đã rỗng:", file=sys.stderr)
+        for item in folders_to_delete:
+            print(f"  - Folder ID {item['id']}: {item.get('name', '-')}", file=sys.stderr)
+
+    if not actionable_scans and not folders_to_delete:
         print("Không có gì để xóa.")
         return 0
 
-    _confirm_delete_password(client, args, config)
-    print("Xác thực thành công. Bắt đầu xóa.")
+    if permanent:
+        _confirm_delete_password(client, args, config)
+        print("Xác thực thành công. Bắt đầu xóa.")
+    else:
+        print("Bắt đầu chuyển scan vào Trash và dọn folder đã chọn; không cần xác nhận mật khẩu.")
 
     scan_failures = 0
     for index, scan in enumerate(actionable_scans, 1):
@@ -819,24 +831,25 @@ def cmd_delete(client: NctlClient, args: argparse.Namespace, config: dict[str, A
                 file=sys.stderr,
             )
 
-    folder_deleted = False
+    folders_deleted = 0
     folder_failures = 0
-    if custom_folder:
-        if scan_failures:
-            print(
-                "Không xóa folder vì vẫn có scan xóa thất bại bên trong.", file=sys.stderr
-            )
-        else:
-            try:
-                client.delete_folder(int(folder["id"]))
-                folder_deleted = True
-                print(f"Đã xóa folder ID {folder['id']}: {folder.get('name', '-')}")
-            except NctlError as exc:
-                folder_failures = 1
-                print(f"LỖI xóa folder ID {folder['id']}: {exc}", file=sys.stderr)
+    for item in folders_to_delete:
+        try:
+            current_folder_id = int(item["id"])
+            # Recheck after scan operations: failed moves/new scans must not be deleted.
+            if _scans_in_folder(client, current_folder_id):
+                folder_failures += 1
+                print(f"Không xóa folder ID {current_folder_id}: vẫn còn scan bên trong.", file=sys.stderr)
+                continue
+            client.delete_folder(current_folder_id)
+            folders_deleted += 1
+            print(f"Đã xóa folder ID {current_folder_id}: {item.get('name', '-')}")
+        except NctlError as exc:
+            folder_failures += 1
+            print(f"LỖI xóa folder ID {item['id']}: {exc}", file=sys.stderr)
 
     failures = scan_failures + folder_failures
-    deleted = len(actionable_scans) - scan_failures + (1 if folder_deleted else 0)
+    deleted = len(actionable_scans) - scan_failures + folders_deleted
     verb = "xóa vĩnh viễn" if permanent else "chuyển/xóa"
     print(f"Hoàn tất: {deleted} đối tượng đã {verb}, {failures} lỗi.")
     return 1 if failures else 0
@@ -1241,7 +1254,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--force", action="store_true", help="Import lại cả file đã thành công trong checkpoint (có thể tạo scan trùng)")
 
     delete = sub.add_parser(
-        "delete", help="Chuyển scan vào Trash hoặc xóa vĩnh viễn sau khi xác nhận"
+        "delete", help="Chuyển scan vào Trash; --permanent cần xác nhận mật khẩu"
     )
     delete_selector = delete.add_mutually_exclusive_group(required=True)
     delete_selector.add_argument("--scan", type=int, help="Chọn một scan ID")
@@ -1250,7 +1263,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--folder",
         help="Chọn scan theo folder ID/tên; folder tùy chỉnh được xóa sau khi rỗng",
     )
-    delete_selector.add_argument("--all", action="store_true", help="Chọn toàn bộ scans")
+    delete_selector.add_argument("--all", action="store_true", help="Chọn toàn bộ scan và dọn folder custom đã rỗng")
     delete.add_argument(
         "--permanent",
         action="store_true",
