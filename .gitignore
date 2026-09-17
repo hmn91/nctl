@@ -14,3 +14,5 @@ credentials.jsonc
 credentials.local.jsonc
 backups/
 *.db
+.nctl-restore.json
+.nctl-restore-*.tmp

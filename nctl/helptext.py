@@ -114,7 +114,18 @@ Folder suy ra từ đường dẫn luôn tự tạo/tái sử dụng, không c�
 --flat bỏ ánh xạ folder con và đưa tất cả vào --folder (bắt buộc).
 
 Một lượt restore hỏi mật khẩu DB một lần; dùng ĐÚNG mật khẩu lúc backup.
-Restore nhiều lần có thể tạo task trùng. Không tự retry khi lỗi import.
+Upload tự thử lại tối đa 3 lần khi lỗi kết nối/timeout/TLS EOF, chờ 2/4/8 giây.
+Không retry lỗi chứng chỉ, HTTP hoặc /scans/import (tránh task trùng).
+Resume mặc định: ghi .nctl-restore.json cạnh mỗi nhóm file .db sau import OK.
+Chạy lại cùng lệnh: bỏ qua file thành công, thử lại file lỗi/chưa xử lý.
+Checkpoint nhận diện nội dung + tên file + máy chủ + tài khoản + folder ID.
+Không lưu mật khẩu/API key. Giữ checkpoint cùng backup khi chuyển thư mục.
+--force import lại dù có checkpoint; có thể tạo task trùng:
+  .\\nctl.exe restore .\\backup --force
+Không chạy đồng thời nhiều restore trên cùng thư mục.
+Checkpoint không kiểm tra scan còn tồn tại; đã xóa scan thì dùng --force.
+Mất phản hồi import hoặc dừng đúng lúc import xong nhưng chưa ghi checkpoint:
+kiểm tra scan trên máy chủ trước khi chạy lại vì có thể đã import thành công.
 """,
     "delete": """Ví dụ:
   .\\nctl.exe delete --scan 12

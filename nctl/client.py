@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
@@ -258,23 +259,49 @@ class NctlClient:
             if partial.exists():
                 partial.unlink()
 
+    def _reset_upload_connection(self) -> None:
+        # Closing adapters discards pooled TLS transports, preserving auth/cookies.
+        self.session.close()
+
     def upload_file(self, path: Path, *, no_enc: bool = True) -> str:
-        with path.open("rb") as source:
-            data = self._json(
-                self._request(
-                    "POST",
-                    "/file/upload",
-                    params={"no_enc": str(int(no_enc))},
-                    files={
-                        "Filedata": (
-                            path.name,
-                            source,
-                            "application/octet-stream",
-                        )
-                    },
-                    timeout=600,
+        for attempt in range(4):
+            try:
+                with path.open("rb") as source:
+                    response = self._request(
+                        "POST",
+                        "/file/upload",
+                        params={"no_enc": str(int(no_enc))},
+                        files={
+                            "Filedata": (
+                                path.name,
+                                source,
+                                "application/octet-stream",
+                            )
+                        },
+                        timeout=600,
+                    )
+                    try:
+                        data = self._json(response)
+                    finally:
+                        response.close()
+                break
+            except NctlError as exc:
+                cause = exc.__cause__
+                transient = isinstance(cause, (requests.ConnectionError, requests.Timeout))
+                if isinstance(cause, requests.exceptions.SSLError):
+                    # Do not retry certificate validation or other permanent TLS errors.
+                    transient = "EOF" in str(cause).upper()
+                if not transient:
+                    raise
+                self._reset_upload_connection()
+                if attempt == 3:
+                    raise
+                delay = 2 ** (attempt + 1)
+                print(
+                    f"  Upload {path.name}: lỗi kết nối, thử lại {attempt + 1}/3 sau {delay}s",
+                    file=sys.stderr,
                 )
-            )
+                time.sleep(delay)
         file_id = data.get("fileuploaded")
         if not file_id:
             raise NctlError(f"máy chủ quét không trả về file ID sau khi upload {path}.")

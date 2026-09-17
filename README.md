@@ -35,6 +35,13 @@ pyinstaller --noconfirm nctl.spec
 
 Không chia sẻ `config.json` hay file credential đã cấu hình vì có thể chứa bí mật.
 
+Restore tự retry upload tối đa 3 lần khi lỗi kết nối/timeout/TLS EOF (chờ 2/4/8 giây),
+không tự retry bước import. Resume mặc định lưu `.nctl-restore.json` cạnh file `.db`:
+chạy lại cùng lệnh sẽ bỏ qua file đã import thành công vào cùng máy chủ/tài khoản/folder.
+Dùng `restore ... --force` để import lại (có thể tạo scan trùng). Giữ checkpoint khi
+chuyển backup; không chạy nhiều restore đồng thời trên cùng thư mục. Nếu mất phản hồi
+import, kiểm tra scan trên server trước khi chạy lại. Chi tiết: `nctl help restore`.
+
 ## Cấu trúc project
 
 - `nctl/`: mã nguồn CLI, API client và help tích hợp.

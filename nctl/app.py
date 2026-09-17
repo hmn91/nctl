@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import sys
 import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -564,6 +566,49 @@ def _ensure_restore_folder(
     return folder_id
 
 
+class RestoreCheckpointError(NctlError):
+    """Import succeeded but resume state could not be persisted; stop the batch."""
+
+
+def _restore_checkpoint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "completed": {}}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("version") != 1 or not isinstance(state.get("completed"), dict):
+            raise ValueError("checkpoint không hợp lệ")
+        return state
+    except (OSError, ValueError) as exc:
+        raise NctlError(f"Không đọc được checkpoint {path}: {exc}; không tự bỏ qua lỗi này.") from exc
+
+
+def _save_restore_checkpoint(path: Path, state: dict[str, Any]) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".nctl-restore-", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(state, output, ensure_ascii=False, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def _restore_key(path: Path, client: NctlClient, folder_id: int) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    # Scope to account too: scan/folder IDs can differ between users.
+    account = client.username or client.session.headers.get("X-ApiKeys", "")
+    identity = [str(client.url).rstrip("/").lower(), str(account), folder_id,
+                path.name, digest.hexdigest()]
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def cmd_restore(client: NctlClient, args: argparse.Namespace, config: dict[str, Any]) -> int:
     items = _restore_items(
         args.paths, root_files_to_input_folder=args.folder is None
@@ -574,6 +619,9 @@ def cmd_restore(client: NctlClient, args: argparse.Namespace, config: dict[str, 
         raise NctlError("--flat cần --folder để xác định folder đích.")
     if args.create_folder and args.folder is None:
         raise NctlError("--create-folder chỉ dùng khi đã chỉ định --folder.")
+    # Validate all state before making any changes on the server.
+    checkpoints = {path.resolve().parent / ".nctl-restore.json" for path, _ in items}
+    states = {path: _restore_checkpoint(path) for path in checkpoints}
     if args.folder is not None:
         folder_id = _folder_id(client, args.folder, create_missing=args.create_folder)
         target_folder_name = str(args.folder).strip()
@@ -588,6 +636,8 @@ def cmd_restore(client: NctlClient, args: argparse.Namespace, config: dict[str, 
     if target_folder_name and not target_folder_name.isdigit() and folder_id is not None:
         folder_cache.setdefault(target_folder_name.casefold(), [folder_id])
     failures = 0
+    skipped = 0
+    successful = 0
     child_folder_count = len({name.casefold() for _, name in items if name})
     print(
         f"Restore {len(items)} file; folder gốc ID {folder_id if folder_id is not None else '-'}; "
@@ -606,13 +656,32 @@ def cmd_restore(client: NctlClient, args: argparse.Namespace, config: dict[str, 
                 f"[{index}/{len(items)}] {path} -> "
                 f"{child_folder_name or target_folder_name} (folder ID {target_folder_id})"
             )
+            checkpoint_path = path.resolve().parent / ".nctl-restore.json"
+            state = states[checkpoint_path]
+            key = _restore_key(path, client, target_folder_id)
+            if not getattr(args, "force", False) and key in state["completed"]:
+                skipped += 1
+                print("  SKIP - đã import thành công (checkpoint)")
+                continue
             result = client.import_db(path, target_folder_id, password)
             imported = result.get("scan") if isinstance(result.get("scan"), dict) else result
+            state["completed"][key] = {"file": path.name, "scan_id": imported.get("id"),
+                                       "completed_at": datetime.now().isoformat()}
+            try:
+                _save_restore_checkpoint(checkpoint_path, state)
+            except OSError as exc:
+                raise RestoreCheckpointError(
+                    f"ĐÃ IMPORT scan {imported.get('id', '?')} nhưng không lưu được checkpoint "
+                    f"{checkpoint_path}: {exc}. Dừng restore; kiểm tra scan trước khi chạy lại để tránh trùng."
+                ) from exc
+            successful += 1
             print(f"  OK - scan ID: {imported.get('id', '?')}")
+        except RestoreCheckpointError:
+            raise
         except (NctlError, OSError) as exc:
             failures += 1
             print(f"  LỖI: {exc}", file=sys.stderr)
-    print(f"Hoàn tất: {len(items) - failures} thành công, {failures} lỗi.")
+    print(f"Hoàn tất: {successful} thành công, {skipped} bỏ qua, {failures} lỗi.")
     return 1 if failures else 0
 
 
@@ -1169,6 +1238,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bỏ qua thư mục con và restore tất cả file vào --folder (bắt buộc)",
     )
     restore.set_defaults(handler=cmd_restore)
+    restore.add_argument("--force", action="store_true", help="Import lại cả file đã thành công trong checkpoint (có thể tạo scan trùng)")
 
     delete = sub.add_parser(
         "delete", help="Chuyển scan vào Trash hoặc xóa vĩnh viễn sau khi xác nhận"
