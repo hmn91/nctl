@@ -72,6 +72,65 @@ class SelectionTests(unittest.TestCase):
 
 
 class MergeTests(unittest.TestCase):
+    def test_combines_cves_only_when_every_other_column_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "a.csv", root / "b.csv"
+            header = ["CVE", "Host", "Plugin ID", "Score", "Plugin Output"]
+            finding = ["192.0.2.1", "236880", "7.8", 'Tiếng Việt, "quoted"\noutput']
+            rows = [
+                ["CVE-2024-26982", *finding],
+                ["CVE-2024-47726", *finding],
+                ["CVE-2024-26982", *finding],
+                ["CVE-2024-47726; CVE-2024-56599, CVE-2024-26982", *finding],
+                ["", *finding],
+                ["CVE-2024-26982", *finding[:2], "9.8", finding[3]],
+                ["CVE-2024-26982", *finding[:3], "different output"],
+                ["", "192.0.2.2", *finding[1:]],
+            ]
+            write_csv(first, [header, *rows])
+            write_csv(second, [header, rows[0], rows[1]])
+            stats = []
+            merged = root / "merged.csv"
+            self.assertEqual(_merge_csv_files([first, second], merged, ["A", "B"], statistics=stats), 5)
+            self.assertEqual(read_csv(merged), [
+                ["Source", *header],
+                ["A", "CVE-2024-26982; CVE-2024-47726; CVE-2024-56599", *finding],
+                ["A", *rows[5]], ["A", *rows[6]], ["A", *rows[7]],
+                ["B", "CVE-2024-26982; CVE-2024-47726", *finding],
+            ])
+            self.assertEqual([s["input_rows"] for s in stats], [8, 2])
+            self.assertEqual([s["duplicates_removed"] for s in stats], [4, 1])
+            self.assertEqual([s["unique_rows"] for s in stats], [4, 1])
+            self.assertEqual(read_csv(first), [header, *rows])
+
+    def test_deduplicates_full_rows_per_file_preserving_order_and_scan_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "a.csv", root / "b.csv"
+            header = ["Host", "Plugin ID", "Plugin Output"]
+            row = ["192.0.2.1", "1", 'Tiếng Việt, "quoted"\nsecond line']
+            different_plugin = ["192.0.2.1", "2", row[2]]
+            different_output = ["192.0.2.1", "1", row[2] + " "]
+            write_csv(first, [header, row, different_plugin, row, different_output, different_plugin])
+            write_csv(second, [header, row, row])
+            originals = [first.read_bytes(), second.read_bytes()]
+            merged = root / "merged.csv"
+            statistics = []
+            self.assertEqual(_merge_csv_files([first, second], merged, ["Scan A", "Scan B"],
+                                             statistics=statistics), 4)
+            self.assertEqual(statistics, [
+                {"file": "a.csv", "scan_name": "Scan A", "input_rows": 5,
+                 "unique_rows": 3, "duplicates_removed": 2},
+                {"file": "b.csv", "scan_name": "Scan B", "input_rows": 2,
+                 "unique_rows": 1, "duplicates_removed": 1},
+            ])
+            self.assertEqual(read_csv(merged), [
+                ["Source", *header], ["Scan A", *row], ["Scan A", *different_plugin],
+                ["Scan A", *different_output], ["Scan B", *row],
+            ])
+            self.assertEqual([first.read_bytes(), second.read_bytes()], originals)
+
     def test_preserves_cells_rows_and_only_one_header(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -84,7 +143,11 @@ class MergeTests(unittest.TestCase):
             write_csv(empty, [header])
             destination = root / "merged.csv"
             names = ['Quét A, "Linux"\nweekly', "Quét B/Windows", "Empty"]
-            self.assertEqual(_merge_csv_files([first, second, empty], destination, names), 2)
+            statistics = []
+            self.assertEqual(_merge_csv_files([first, second, empty], destination, names,
+                                             statistics=statistics), 2)
+            self.assertEqual([item["input_rows"] for item in statistics], [1, 1, 0])
+            self.assertEqual([item["duplicates_removed"] for item in statistics], [0, 0, 0])
             previous_limit = csv.field_size_limit(2**31 - 1)
             try:
                 self.assertEqual(read_csv(destination), [["Source", *header],
@@ -145,13 +208,15 @@ class ReportTests(unittest.TestCase):
                 def export(scan_id, destination, **kwargs):
                     if fail and scan_id == 2:
                         raise NctlError("Export failed")
-                    write_csv(destination, [["id", "Host", "output"], [str(scan_id), "192.0.2.1", "data\nmore"]])
+                    row = [str(scan_id), "192.0.2.1", "data\nmore"]
+                    write_csv(destination, [["id", "Host", "output"], row, row])
 
                 client.export_csv.side_effect = export
                 args = build_parser().parse_args([
                     "report", "--all", "--output", directory, *(["--merge"] if merge else []),
                 ])
-                with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+                output = io.StringIO()
+                with patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
                     self.assertEqual(cmd_report(client, args, {}), 2 if fail else 0)
                 root = next(Path(directory).iterdir())
                 manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -160,8 +225,19 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(client.export_csv.call_count, 3)
                 self.assertEqual((root / "merged.csv").exists(), merge)
                 for item in manifest["files"]:
-                    self.assertEqual(read_csv(root / item["file"])[0], ["id", "Host", "output"])
+                    original_rows = read_csv(root / item["file"])
+                    self.assertEqual(original_rows[0], ["id", "Host", "output"])
+                    self.assertEqual(len(original_rows), 3)
                 if merge:
+                    self.assertEqual(manifest["merged"]["rows"], 2 if fail else 3)
+                    self.assertEqual(manifest["merged"]["input_rows"], 4 if fail else 6)
+                    self.assertEqual(manifest["merged"]["duplicates_removed"], 2 if fail else 3)
+                    self.assertEqual(len(manifest["merged"]["files"]), 2 if fail else 3)
+                    self.assertIn("đọc 2 dòng dữ liệu; loại 1 dòng trùng; giữ 1 dòng unique", output.getvalue())
+                    self.assertIn(
+                        "đọc 4 dòng dữ liệu; loại 2 dòng trùng; giữ 2 dòng unique" if fail else
+                        "đọc 6 dòng dữ liệu; loại 3 dòng trùng; giữ 3 dòng unique", output.getvalue(),
+                    )
                     self.assertEqual(read_csv(root / "merged.csv"), [
                         ["Source", "id", "Host", "output"], ["Quét/Linux", "1", "192.0.2.1", "data\nmore"],
                         *([] if fail else [['Windows, "weekly"', "2", "192.0.2.1", "data\nmore"]]),

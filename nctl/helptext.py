@@ -113,6 +113,13 @@ Output mặc định: reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
 Tên file: scan-12_Ten scan.csv; manifest.json ghi các file và lỗi.
 --merge tạo thêm merged.csv từ toàn bộ CSV thành công của lượt chạy, giữ nguyên file lẻ.
 File gộp chỉ có một header ở dòng đầu; dữ liệu tất cả scan nối tiếp phía sau.
+Trong từng CSV, gộp các dòng giống ở mọi cột ngoài CVE, giữ thứ tự xuất hiện đầu tiên.
+Gom CVE khác nhau vào một ô, phân cách bằng "; ", bỏ CVE lặp và giữ đủ thông tin.
+Dòng khác severity/score/plugin output hoặc bất kỳ cột nào ngoài CVE vẫn giữ riêng.
+Dòng giống nhau ở các CSV của scan khác nhau vẫn được giữ theo Source tương ứng.
+In số dòng đã đọc, dòng trùng/gộp bị loại và dòng unique giữ lại cho từng CSV và tổng.
+Các số đếm này cũng được lưu trong manifest.json; không tính header hoặc dòng trống.
+Chỉ lọc trùng khi --merge; các CSV lẻ vẫn giữ nguyên dữ liệu gốc.
 Cột Source ở đầu file gộp ghi tên scan gốc cho từng dòng, giúp lọc khi IP trùng.
 Tên scan giữ nguyên, không lấy tên file đã thay ký tự; scan thiếu tên dùng scan-ID.
 Giữ nguyên dấu phẩy, dấu ngoặc kép, Unicode và nội dung xuống dòng trong ô.

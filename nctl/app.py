@@ -333,8 +333,11 @@ def _csv_header(reader: Any, path: Path) -> list[str]:
     return header
 
 
-def _merge_csv_files(paths: Sequence[Path], destination: Path, scan_names: Sequence[str]) -> int:
-    """Stream CSV records, preserving multiline cells and the union of columns."""
+def _merge_csv_files(
+    paths: Sequence[Path], destination: Path, scan_names: Sequence[str],
+    *, statistics: list[dict[str, Any]] | None = None,
+) -> int:
+    """Group records per input by all non-CVE cells, retaining each distinct CVE."""
     if not paths:
         raise NctlError("Không có file CSV thành công để gộp.")
     if len(scan_names) != len(paths):
@@ -370,6 +373,10 @@ def _merge_csv_files(paths: Sequence[Path], destination: Path, scan_names: Seque
                     if _csv_header(reader, path) != header:
                         raise NctlError(f"Header CSV {path} đã thay đổi trong lúc gộp.")
                     indices = [positions[name] for name in header]
+                    cve_index = header.index("CVE") if "CVE" in header else None
+                    groups: dict[tuple[str, ...], tuple[list[str], dict[str, None]]] = {}
+                    input_rows = 0
+                    duplicates_removed = 0
                     for row in reader:
                         if not row or row == header:
                             continue
@@ -377,12 +384,32 @@ def _merge_csv_files(paths: Sequence[Path], destination: Path, scan_names: Seque
                             raise NctlError(
                                 f"CSV {path}, dòng {reader.line_num}: số ô khác số cột header."
                             )
-                        merged_row = [""] * len(columns)
-                        merged_row[0] = scan_name
-                        for index, value in zip(indices, row):
-                            merged_row[index] = value
+                        input_rows += 1
+                        row_key = tuple(value for index, value in enumerate(row) if index != cve_index)
+                        if row_key in groups:
+                            duplicates_removed += 1
+                        else:
+                            merged_row = [""] * len(columns)
+                            merged_row[0] = scan_name
+                            for index, value in zip(indices, row):
+                                merged_row[index] = value
+                            groups[row_key] = (merged_row, {})
+                        if cve_index is not None:
+                            cves = groups[row_key][1]
+                            for cve in re.split(r"[\s,;]+", row[cve_index].strip()):
+                                if cve:
+                                    cves.setdefault(cve, None)
+                    for merged_row, cves in groups.values():
+                        if cve_index is not None:
+                            merged_row[positions["CVE"]] = "; ".join(cves)
                         writer.writerow(merged_row)
                         count += 1
+                    if statistics is not None:
+                        statistics.append({
+                            "file": path.name, "scan_name": scan_name,
+                            "input_rows": input_rows, "unique_rows": len(groups),
+                            "duplicates_removed": duplicates_removed,
+                        })
         partial.replace(destination)
     except (csv.Error, UnicodeError) as exc:
         raise NctlError(f"Không đọc được CSV để gộp: {exc}") from exc
@@ -434,9 +461,26 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
     if args.merge:
         try:
             merged = report_dir / "merged.csv"
-            row_count = _merge_csv_files(exported, merged, scan_names)
-            manifest["merged"] = {"file": merged.name, "rows": row_count, "scans": len(exported)}
-            print(f"Đã gộp {len(exported)} CSV, {row_count} dòng dữ liệu vào {merged}")
+            statistics: list[dict[str, Any]] = []
+            row_count = _merge_csv_files(exported, merged, scan_names, statistics=statistics)
+            input_rows = sum(item["input_rows"] for item in statistics)
+            duplicates_removed = sum(item["duplicates_removed"] for item in statistics)
+            manifest["merged"] = {
+                "file": merged.name, "rows": row_count, "scans": len(exported),
+                "input_rows": input_rows, "duplicates_removed": duplicates_removed,
+                "group_by": "all_columns_except_cve", "cve_separator": "; ",
+                "files": statistics,
+            }
+            print("Quy tắc unique: so sánh mọi cột ngoài CVE trong từng CSV; gom các CVE vào một ô.")
+            for item in statistics:
+                print(
+                    f"  Unique {item['file']}: đọc {item['input_rows']} dòng dữ liệu; "
+                    f"loại {item['duplicates_removed']} dòng trùng; giữ {item['unique_rows']} dòng unique."
+                )
+            print(
+                f"Tổng gộp {len(exported)} CSV: đọc {input_rows} dòng dữ liệu; "
+                f"loại {duplicates_removed} dòng trùng; giữ {row_count} dòng unique vào {merged}"
+            )
         except (NctlError, OSError) as exc:
             manifest["errors"].append({"stage": "merge", "error": str(exc)})
             print(f"LỖI gộp CSV: {exc}", file=sys.stderr)

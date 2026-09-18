@@ -41,6 +41,12 @@ Xuất report CSV đầy đủ cột, mỗi scan một file riêng (kết quả 
 Output mặc định trong `reports/nctl-report-.../`. `--merge` tạo thêm `merged.csv`
 với một header ở đầu và dữ liệu nối tiếp của các CSV xuất thành công; giữ nguyên file lẻ.
 Cột `Source` ở đầu file gộp chứa tên scan sinh ra từng dòng, giúp lọc các IP trùng giữa scan.
+Khi gộp, các dòng giống ở mọi cột ngoài `CVE` trong từng CSV được gom thành một dòng,
+theo thứ tự ban đầu; ô `CVE` chứa toàn bộ CVE khác nhau, phân cách bằng `; `.
+Dòng khác ở bất kỳ cột nào ngoài `CVE` vẫn giữ riêng.
+Dòng giống nhau từ các scan khác nhau vẫn được giữ với `Source` tương ứng.
+Log và `manifest.json` ghi số dòng đọc, dòng trùng bị loại và dòng unique giữ lại cho từng CSV và tổng.
+Chỉ `merged.csv` được lọc trùng khi dùng `--merge`; các CSV lẻ giữ nguyên dữ liệu gốc.
 `--all` bỏ qua Trash; thêm `--include-trash` để lấy cả Trash. Lỗi được ghi vào `manifest.json`
 và trả exit code 2. Chi tiết: `nctl help report`.
 
