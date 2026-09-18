@@ -83,10 +83,12 @@ class MergeTests(unittest.TestCase):
             write_csv(second, [header, rows[1]])
             write_csv(empty, [header])
             destination = root / "merged.csv"
-            self.assertEqual(_merge_csv_files([first, second, empty], destination), 2)
+            names = ['Quét A, "Linux"\nweekly', "Quét B/Windows", "Empty"]
+            self.assertEqual(_merge_csv_files([first, second, empty], destination, names), 2)
             previous_limit = csv.field_size_limit(2**31 - 1)
             try:
-                self.assertEqual(read_csv(destination), [header, *rows])
+                self.assertEqual(read_csv(destination), [["Source", *header],
+                                                       [names[0], *rows[0]], [names[1], *rows[1]]])
             finally:
                 csv.field_size_limit(previous_limit)
             self.assertTrue(destination.read_bytes().startswith(b"\xef\xbb\xbf"))
@@ -99,14 +101,15 @@ class MergeTests(unittest.TestCase):
             write_csv(b, [["score", "id"], ["9.1", "2"]])
             write_csv(c, [["output", "id"], ["other", "3"]])
             merged = root / "merged.csv"
-            self.assertEqual(_merge_csv_files([a, b, c], merged), 3)
+            self.assertEqual(_merge_csv_files([a, b, c], merged, ["A", "B", "C"]), 3)
             self.assertEqual(read_csv(merged), [
-                ["id", "output", "score"], ["1", "text", ""],
-                ["2", "", "9.1"], ["3", "other", ""],
+                ["Source", "id", "output", "score"], ["A", "1", "text", ""],
+                ["B", "2", "", "9.1"], ["C", "3", "other", ""],
             ])
 
     def test_bad_csv_does_not_publish_partial_merge_or_overwrite_existing(self):
-        bad_inputs = ["", "id,id\n1,2\n", "id,output\n1\n", 'id,output\n1,"unfinished']
+        bad_inputs = ["", "id,id\n1,2\n", "id,output\n1\n", 'id,output\n1,"unfinished',
+                      "Source,id\nexisting,1\n"]
         for content in bad_inputs:
             with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -114,7 +117,7 @@ class MergeTests(unittest.TestCase):
                 source.write_text(content, encoding="utf-8")
                 merged.write_bytes(b"existing")
                 with self.assertRaises(NctlError):
-                    _merge_csv_files([source], merged)
+                    _merge_csv_files([source], merged, ["Scan"])
                 self.assertEqual(merged.read_bytes(), b"existing")
                 self.assertFalse((root / "merged.csv.part").exists())
 
@@ -123,7 +126,7 @@ class MergeTests(unittest.TestCase):
             source = Path(directory) / "source.csv"
             write_csv(source, [["id"], ["1"]])
             with self.assertRaises(NctlError):
-                _merge_csv_files([source], source)
+                _merge_csv_files([source], source, ["Scan"])
             self.assertEqual(read_csv(source), [["id"], ["1"]])
 
 
@@ -135,14 +138,14 @@ class ReportTests(unittest.TestCase):
                 client.url = "https://scanner.example"
                 client.list_folders.return_value = []
                 client.list_scans.return_value = {"scans": [
-                    {"id": 1, "name": "Same/name"}, {"id": 2, "name": "Same/name"},
-                    {"id": 3, "name": "Same/name"},
+                    {"id": 1, "name": "Quét/Linux"}, {"id": 2, "name": 'Windows, "weekly"'},
+                    {"id": 3, "name": "Quét:Linux"},
                 ]}
 
                 def export(scan_id, destination, **kwargs):
                     if fail and scan_id == 2:
                         raise NctlError("Export failed")
-                    write_csv(destination, [["id", "output"], [str(scan_id), "data\nmore"]])
+                    write_csv(destination, [["id", "Host", "output"], [str(scan_id), "192.0.2.1", "data\nmore"]])
 
                 client.export_csv.side_effect = export
                 args = build_parser().parse_args([
@@ -156,10 +159,13 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(len(manifest["errors"]), int(fail))
                 self.assertEqual(client.export_csv.call_count, 3)
                 self.assertEqual((root / "merged.csv").exists(), merge)
+                for item in manifest["files"]:
+                    self.assertEqual(read_csv(root / item["file"])[0], ["id", "Host", "output"])
                 if merge:
                     self.assertEqual(read_csv(root / "merged.csv"), [
-                        ["id", "output"], ["1", "data\nmore"],
-                        *([] if fail else [["2", "data\nmore"]]), ["3", "data\nmore"],
+                        ["Source", "id", "Host", "output"], ["Quét/Linux", "1", "192.0.2.1", "data\nmore"],
+                        *([] if fail else [['Windows, "weekly"', "2", "192.0.2.1", "data\nmore"]]),
+                        ["Quét:Linux", "3", "192.0.2.1", "data\nmore"],
                     ])
 
     def test_all_failed_exports_do_not_create_merged_csv(self):

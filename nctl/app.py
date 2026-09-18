@@ -333,10 +333,12 @@ def _csv_header(reader: Any, path: Path) -> list[str]:
     return header
 
 
-def _merge_csv_files(paths: Sequence[Path], destination: Path) -> int:
+def _merge_csv_files(paths: Sequence[Path], destination: Path, scan_names: Sequence[str]) -> int:
     """Stream CSV records, preserving multiline cells and the union of columns."""
     if not paths:
         raise NctlError("Không có file CSV thành công để gộp.")
+    if len(scan_names) != len(paths):
+        raise NctlError("Mỗi file CSV phải có tên scan tương ứng để ghi cột Source.")
     if any(path.resolve() == destination.resolve() for path in paths):
         raise NctlError("File CSV gộp phải khác các file nguồn.")
     previous_limit = csv.field_size_limit()
@@ -344,12 +346,14 @@ def _merge_csv_files(paths: Sequence[Path], destination: Path) -> int:
     partial = destination.with_suffix(destination.suffix + ".part")
     count = 0
     try:
-        columns: list[str] = []
+        columns: list[str] = ["Source"]
         headers: list[list[str]] = []
-        known: set[str] = set()
+        known: set[str] = {"Source"}
         for path in paths:
             with path.open(encoding="utf-8-sig", newline="") as source:
                 header = _csv_header(csv.reader(source, strict=True), path)
+            if "Source" in header:
+                raise NctlError(f"CSV {path} đã có cột Source; không thể thêm cột tên scan.")
             headers.append(header)
             for name in header:
                 if name not in known:
@@ -360,7 +364,7 @@ def _merge_csv_files(paths: Sequence[Path], destination: Path) -> int:
             writer = csv.writer(output)
             writer.writerow(columns)
             positions = {name: index for index, name in enumerate(columns)}
-            for path, header in zip(paths, headers):
+            for path, header, scan_name in zip(paths, headers, scan_names):
                 with path.open(encoding="utf-8-sig", newline="") as source:
                     reader = csv.reader(source, strict=True)
                     if _csv_header(reader, path) != header:
@@ -374,6 +378,7 @@ def _merge_csv_files(paths: Sequence[Path], destination: Path) -> int:
                                 f"CSV {path}, dòng {reader.line_num}: số ô khác số cột header."
                             )
                         merged_row = [""] * len(columns)
+                        merged_row[0] = scan_name
                         for index, value in zip(indices, row):
                             merged_row[index] = value
                         writer.writerow(merged_row)
@@ -407,6 +412,7 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
     manifest_path = report_dir / "manifest.json"
     _write_manifest(manifest_path, manifest)
     exported: list[Path] = []
+    scan_names: list[str] = []
     print(f"Xuất CSV đầy đủ cột cho {len(selected)} scan vào {report_dir}")
     for index, scan in enumerate(selected, 1):
         scan_id = int(scan["id"])
@@ -418,7 +424,9 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                 poll_interval=args.poll_interval, export_timeout=args.export_timeout,
             )
             exported.append(destination)
-            manifest["files"].append({"scan_id": scan_id, "file": destination.name})
+            scan_name = str(scan.get("name") or f"scan-{scan_id}")
+            scan_names.append(scan_name)
+            manifest["files"].append({"scan_id": scan_id, "scan_name": scan_name, "file": destination.name})
         except (NctlError, OSError) as exc:
             manifest["errors"].append({"scan_id": scan_id, "error": str(exc)})
             print(f"LỖI scan {scan_id}: {exc}", file=sys.stderr)
@@ -426,7 +434,7 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
     if args.merge:
         try:
             merged = report_dir / "merged.csv"
-            row_count = _merge_csv_files(exported, merged)
+            row_count = _merge_csv_files(exported, merged, scan_names)
             manifest["merged"] = {"file": merged.name, "rows": row_count, "scans": len(exported)}
             print(f"Đã gộp {len(exported)} CSV, {row_count} dòng dữ liệu vào {merged}")
         except (NctlError, OSError) as exc:
@@ -1378,7 +1386,7 @@ def build_parser() -> argparse.ArgumentParser:
     report_selector.add_argument("--all", action="store_true", help="Toàn bộ scan (mặc định bỏ qua Trash)")
     report.add_argument("--include-trash", action="store_true", help="Bao gồm Trash khi dùng --all")
     report.add_argument("--output", default="reports", help="Thư mục chứa lượt report (mặc định: reports)")
-    report.add_argument("--merge", action="store_true", help="Gộp thêm merged.csv, chỉ giữ một header; vẫn giữ CSV lẻ")
+    report.add_argument("--merge", action="store_true", help="Gộp thêm merged.csv với cột Source là tên scan, chỉ giữ một header")
     report.add_argument("--poll-interval", type=float, default=1.0, help="Chu kỳ kiểm tra export (giây)")
     report.add_argument("--export-timeout", type=float, default=1800, help="Timeout mỗi export (giây)")
     report.set_defaults(handler=cmd_report)

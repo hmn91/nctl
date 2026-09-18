@@ -113,6 +113,8 @@ Output mặc định: reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
 Tên file: scan-12_Ten scan.csv; manifest.json ghi các file và lỗi.
 --merge tạo thêm merged.csv từ toàn bộ CSV thành công của lượt chạy, giữ nguyên file lẻ.
 File gộp chỉ có một header ở dòng đầu; dữ liệu tất cả scan nối tiếp phía sau.
+Cột Source ở đầu file gộp ghi tên scan gốc cho từng dòng, giúp lọc khi IP trùng.
+Tên scan giữ nguyên, không lấy tên file đã thay ký tự; scan thiếu tên dùng scan-ID.
 Giữ nguyên dấu phẩy, dấu ngoặc kép, Unicode và nội dung xuống dòng trong ô.
 Nếu các CSV có cột khác nhau, lấy hợp tất cả cột, ánh xạ theo tên và để trống ô thiếu.
 File gộp dùng UTF-8 BOM để mở Unicode trong Excel.

@@ -40,6 +40,7 @@ Xuất report CSV đầy đủ cột, mỗi scan một file riêng (kết quả 
 
 Output mặc định trong `reports/nctl-report-.../`. `--merge` tạo thêm `merged.csv`
 với một header ở đầu và dữ liệu nối tiếp của các CSV xuất thành công; giữ nguyên file lẻ.
+Cột `Source` ở đầu file gộp chứa tên scan sinh ra từng dòng, giúp lọc các IP trùng giữa scan.
 `--all` bỏ qua Trash; thêm `--include-trash` để lấy cả Trash. Lỗi được ghi vào `manifest.json`
 và trả exit code 2. Chi tiết: `nctl help report`.
 
