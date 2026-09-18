@@ -13,6 +13,7 @@ credentials.local.json
 credentials.jsonc
 credentials.local.jsonc
 backups/
+reports/
 *.db
 .nctl-restore.json
 .nctl-restore-*.tmp

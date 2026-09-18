@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
 import hashlib
 import ipaddress
@@ -304,6 +305,137 @@ def _selected_scans(client: NctlClient, args: argparse.Namespace) -> list[dict[s
 def _safe_name(value: Any, limit: int = 80, fallback: str = "scan") -> str:
     text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value)).strip(" ._")
     return (text or fallback)[:limit]
+
+
+def _report_scans(client: NctlClient, args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.folder is not None or args.folders:
+        values = [args.folder] if args.folder is not None else [
+            value.strip() for item in args.folders for value in item.split(",")
+            if value.strip()
+        ]
+        if not values:
+            raise NctlError("Danh sách folder không được rỗng.")
+        folder_ids = list(dict.fromkeys(_folder_id(client, value) for value in values))
+        return _merge_scans(*(_scans_in_folder(client, fid) for fid in folder_ids))
+    # Match backup's default for --all; explicit IDs can also select Trash scans.
+    selection = argparse.Namespace(**vars(args))
+    selection.include_trash = args.include_trash or not args.all
+    selected = _selected_scans(client, selection)
+    if not args.all and not selected:
+        raise NctlError("Danh sách scan ID không được rỗng.")
+    return _merge_scans(selected)
+
+
+def _csv_header(reader: Any, path: Path) -> list[str]:
+    header = next((row for row in reader if row), [])
+    if not header or any(not name.strip() for name in header) or len(set(header)) != len(header):
+        raise NctlError(f"CSV {path} không có header hợp lệ hoặc có cột trùng tên.")
+    return header
+
+
+def _merge_csv_files(paths: Sequence[Path], destination: Path) -> int:
+    """Stream CSV records, preserving multiline cells and the union of columns."""
+    if not paths:
+        raise NctlError("Không có file CSV thành công để gộp.")
+    if any(path.resolve() == destination.resolve() for path in paths):
+        raise NctlError("File CSV gộp phải khác các file nguồn.")
+    previous_limit = csv.field_size_limit()
+    csv.field_size_limit(2**31 - 1)  # Plugin output can exceed csv's 128 KiB default.
+    partial = destination.with_suffix(destination.suffix + ".part")
+    count = 0
+    try:
+        columns: list[str] = []
+        headers: list[list[str]] = []
+        known: set[str] = set()
+        for path in paths:
+            with path.open(encoding="utf-8-sig", newline="") as source:
+                header = _csv_header(csv.reader(source, strict=True), path)
+            headers.append(header)
+            for name in header:
+                if name not in known:
+                    columns.append(name)
+                    known.add(name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with partial.open("w", encoding="utf-8-sig", newline="") as output:
+            writer = csv.writer(output)
+            writer.writerow(columns)
+            positions = {name: index for index, name in enumerate(columns)}
+            for path, header in zip(paths, headers):
+                with path.open(encoding="utf-8-sig", newline="") as source:
+                    reader = csv.reader(source, strict=True)
+                    if _csv_header(reader, path) != header:
+                        raise NctlError(f"Header CSV {path} đã thay đổi trong lúc gộp.")
+                    indices = [positions[name] for name in header]
+                    for row in reader:
+                        if not row or row == header:
+                            continue
+                        if len(row) != len(header):
+                            raise NctlError(
+                                f"CSV {path}, dòng {reader.line_num}: số ô khác số cột header."
+                            )
+                        merged_row = [""] * len(columns)
+                        for index, value in zip(indices, row):
+                            merged_row[index] = value
+                        writer.writerow(merged_row)
+                        count += 1
+        partial.replace(destination)
+    except (csv.Error, UnicodeError) as exc:
+        raise NctlError(f"Không đọc được CSV để gộp: {exc}") from exc
+    finally:
+        csv.field_size_limit(previous_limit)
+        if partial.exists():
+            partial.unlink()
+    return count
+
+
+def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) -> int:
+    if not (0 <= args.poll_interval < float("inf")) or not (0 < args.export_timeout < float("inf")):
+        raise NctlError("--poll-interval phải >= 0 và --export-timeout phải > 0 (số hữu hạn).")
+    selected = _report_scans(client, args)
+    if not selected:
+        print("Không có scan trong phạm vi đã chọn.")
+        return 0
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    report_dir = Path(args.output).expanduser() / f"nctl-report-{stamp}"
+    report_dir.mkdir(parents=True, exist_ok=False)
+    manifest: dict[str, Any] = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "server_url": client.url,
+        "format": "csv", "history_mode": "latest", "columns": "all",
+        "files": [], "errors": [],
+    }
+    manifest_path = report_dir / "manifest.json"
+    _write_manifest(manifest_path, manifest)
+    exported: list[Path] = []
+    print(f"Xuất CSV đầy đủ cột cho {len(selected)} scan vào {report_dir}")
+    for index, scan in enumerate(selected, 1):
+        scan_id = int(scan["id"])
+        destination = report_dir / f"scan-{scan_id}_{_safe_name(scan.get('name') or 'scan')}.csv"
+        print(f"[{index}/{len(selected)}] Scan {scan_id}: {scan.get('name', '-')}")
+        try:
+            client.export_csv(
+                scan_id, destination,
+                poll_interval=args.poll_interval, export_timeout=args.export_timeout,
+            )
+            exported.append(destination)
+            manifest["files"].append({"scan_id": scan_id, "file": destination.name})
+        except (NctlError, OSError) as exc:
+            manifest["errors"].append({"scan_id": scan_id, "error": str(exc)})
+            print(f"LỖI scan {scan_id}: {exc}", file=sys.stderr)
+        _write_manifest(manifest_path, manifest)
+    if args.merge:
+        try:
+            merged = report_dir / "merged.csv"
+            row_count = _merge_csv_files(exported, merged)
+            manifest["merged"] = {"file": merged.name, "rows": row_count, "scans": len(exported)}
+            print(f"Đã gộp {len(exported)} CSV, {row_count} dòng dữ liệu vào {merged}")
+        except (NctlError, OSError) as exc:
+            manifest["errors"].append({"stage": "merge", "error": str(exc)})
+            print(f"LỖI gộp CSV: {exc}", file=sys.stderr)
+        _write_manifest(manifest_path, manifest)
+    errors = len(manifest["errors"])
+    print(f"Hoàn tất: {len(exported)}/{len(selected)} CSV; {errors} lỗi. Chi tiết: {manifest_path}")
+    return 2 if errors else 0
 
 
 def _backup_folder_layout(
@@ -1189,7 +1321,7 @@ class NctlArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = NctlArgumentParser(
         prog="nctl",
-        description="Backup, restore, tạo và theo dõi scan trên máy chủ quét.",
+        description="Backup, restore, xuất report CSV, tạo và theo dõi scan trên máy chủ quét.",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--config", type=Path, default=Path("config.json"), help="JSON config (mặc định: config.json)")
@@ -1205,7 +1337,7 @@ def build_parser() -> argparse.ArgumentParser:
     help_command = sub.add_parser("help", help="Hướng dẫn offline kèm ví dụ sử dụng")
     help_command.add_argument(
         "topic", nargs="*", metavar="TOPIC",
-        help="setup, status, folders, scans, backup, restore, delete, task [create|launch], monitor",
+        help="setup, status, folders, scans, backup, report, restore, delete, task [create|launch], monitor",
     )
     help_command.epilog = "Ví dụ: nctl help; nctl help setup; nctl help task create"
 
@@ -1236,6 +1368,20 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--poll-interval", type=float, default=1.0, help="Chu kỳ kiểm tra export")
     backup.add_argument("--export-timeout", type=float, default=1800, help="Timeout mỗi export")
     backup.set_defaults(handler=cmd_backup)
+
+    report = sub.add_parser("report", help="Xuất report CSV đầy đủ cột, mỗi scan một file")
+    report_selector = report.add_mutually_exclusive_group(required=True)
+    report_selector.add_argument("--scan", type=int, help="Một scan ID")
+    report_selector.add_argument("--scans", help="Danh sách scan ID, phân cách bằng dấu phẩy")
+    report_selector.add_argument("--folder", help="Một folder ID hoặc tên")
+    report_selector.add_argument("--folders", nargs="+", help="Nhiều folder ID/tên, cách bằng dấu cách hoặc dấu phẩy")
+    report_selector.add_argument("--all", action="store_true", help="Toàn bộ scan (mặc định bỏ qua Trash)")
+    report.add_argument("--include-trash", action="store_true", help="Bao gồm Trash khi dùng --all")
+    report.add_argument("--output", default="reports", help="Thư mục chứa lượt report (mặc định: reports)")
+    report.add_argument("--merge", action="store_true", help="Gộp thêm merged.csv, chỉ giữ một header; vẫn giữ CSV lẻ")
+    report.add_argument("--poll-interval", type=float, default=1.0, help="Chu kỳ kiểm tra export (giây)")
+    report.add_argument("--export-timeout", type=float, default=1800, help="Timeout mỗi export (giây)")
+    report.set_defaults(handler=cmd_report)
 
     restore = sub.add_parser("restore", help="Restore hàng loạt file .db")
     restore.add_argument("paths", nargs="+", help="File .db hoặc thư mục (tìm đệ quy)")

@@ -12,6 +12,17 @@ import urllib3
 from . import __version__
 
 
+# CSV column keys supported by the scan export API (including optional scores).
+CSV_COLUMNS = (
+    "id", "cve", "cvss", "risk", "hostname", "protocol", "port",
+    "plugin_name", "synopsis", "description", "solution", "see_also",
+    "plugin_output", "stig_severity", "cvss4_base_score", "cvss4_bt_score",
+    "cvss3_base_score", "cvss_temporal_score", "cvss3_temporal_score",
+    "vpr_score", "epss_score", "risk_factor", "references",
+    "plugin_information", "exploitable_with",
+)
+
+
 class NctlError(RuntimeError):
     """Lỗi trả về từ máy chủ quét hoặc lỗi kết nối."""
 
@@ -221,6 +232,45 @@ class NctlClient:
             json={"format": "db", "password": password},
             timeout=120,
         )
+        self._download_export(
+            scan_id, queued, destination,
+            poll_interval=poll_interval, export_timeout=export_timeout,
+            label=f"scan {scan_id}, history {history_id}",
+        )
+
+    def export_csv(
+        self,
+        scan_id: int,
+        destination: Path,
+        *,
+        poll_interval: float = 1.0,
+        export_timeout: float = 1800,
+    ) -> None:
+        """Export the latest scan result with every supported CSV column enabled."""
+        queued = self.post_json(
+            f"/scans/{scan_id}/export",
+            json={
+                "format": "csv",
+                "reportContents": {"csvColumns": dict.fromkeys(CSV_COLUMNS, True)},
+            },
+            timeout=120,
+        )
+        self._download_export(
+            scan_id, queued, destination,
+            poll_interval=poll_interval, export_timeout=export_timeout,
+            label=f"scan {scan_id}",
+        )
+
+    def _download_export(
+        self,
+        scan_id: int,
+        queued: dict[str, Any],
+        destination: Path,
+        *,
+        poll_interval: float,
+        export_timeout: float,
+        label: str,
+    ) -> None:
         token = queued.get("token")
         if not token:
             raise NctlError(f"Không nhận được export token cho scan {scan_id}.")
@@ -234,11 +284,11 @@ class NctlClient:
                 break
             if status in {"error", "failed", "cancelled", "canceled"}:
                 raise NctlError(
-                    f"Export scan {scan_id}, history {history_id} thất bại: {status_data}"
+                    f"Export {label} thất bại: {status_data}"
                 )
             if time.monotonic() - started >= export_timeout:
                 raise NctlError(
-                    f"Export scan {scan_id}, history {history_id} quá thời hạn "
+                    f"Export {label} quá thời hạn "
                     f"{export_timeout:g} giây."
                 )
             time.sleep(poll_interval)
@@ -254,6 +304,8 @@ class NctlClient:
                     if chunk:
                         output.write(chunk)
             partial.replace(destination)
+        except requests.RequestException as exc:
+            raise NctlError(f"Tải export {label} bị gián đoạn: {exc}") from exc
         finally:
             response.close()
             if partial.exists():

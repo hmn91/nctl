@@ -1,6 +1,6 @@
 # nctl
 
-Công cụ dòng lệnh quản lý máy chủ quét: list scan/history, backup/restore `.db`, tạo task và monitor.
+Công cụ dòng lệnh quản lý máy chủ quét: list scan/history, report CSV, backup/restore `.db`, tạo task và monitor.
 
 ## Bắt đầu
 
@@ -17,6 +17,7 @@ Mọi hướng dẫn, ví dụ và lưu ý an toàn được tích hợp trong c
 .\nctl.exe --help
 .\nctl.exe help setup
 .\nctl.exe help backup
+.\nctl.exe help report
 .\nctl.exe help restore
 .\nctl.exe help delete
 .\nctl.exe help task
@@ -24,6 +25,23 @@ Mọi hướng dẫn, ví dụ và lưu ý an toàn được tích hợp trong c
 ```
 
 Bản Windows portable không cần Python. Khi chạy mã nguồn: `python nctl.py help` hoặc `python -m nctl help`.
+
+## Report CSV
+
+Xuất report CSV đầy đủ cột, mỗi scan một file riêng (kết quả mới nhất):
+
+```powershell
+.\nctl.exe report --scan 12
+.\nctl.exe report --scans "12,15,20"
+.\nctl.exe report --folder "Target Group 1"
+.\nctl.exe report --folders "Target Group 1" "Target Group 2" --merge
+.\nctl.exe report --all --merge
+```
+
+Output mặc định trong `reports/nctl-report-.../`. `--merge` tạo thêm `merged.csv`
+với một header ở đầu và dữ liệu nối tiếp của các CSV xuất thành công; giữ nguyên file lẻ.
+`--all` bỏ qua Trash; thêm `--include-trash` để lấy cả Trash. Lỗi được ghi vào `manifest.json`
+và trả exit code 2. Chi tiết: `nctl help report`.
 
 ## Phát triển
 

@@ -1,6 +1,6 @@
 """Offline user guide shipped with the CLI and portable executable."""
 
-OVERVIEW = """nctl - quản lý scan và backup/restore DB
+OVERVIEW = """nctl - quản lý scan, report CSV và backup/restore DB
 
 Bắt đầu:
   1. Đặt EXE và config.json trong cùng thư mục; mở terminal tại thư mục đó.
@@ -13,6 +13,7 @@ Ví dụ nhanh:
   .\\nctl.exe help setup
   .\\nctl.exe help restore
   .\\nctl.exe backup --all
+  .\\nctl.exe report --all --merge
   .\\nctl.exe restore .\\backup
 
 Tùy chọn kết nối phải đứng TRƯỚC subcommand:
@@ -92,6 +93,32 @@ Tên file: scan-12_history-35_Ten scan.db; mỗi history là một file riêng.
 Manifest lưu folder gốc, tên file và các lỗi; không lưu mật khẩu.
 Backup cũ vẫn có thể restore mà không cần đổi tên.
 Lỗi một history không dừng phần còn lại; exit code khác 0 nếu có lỗi.
+""",
+    "report": """Ví dụ:
+  .\\nctl.exe report --scan 12
+  .\\nctl.exe report --scans "12,15,20"
+  .\\nctl.exe report --folder "Target Group 1"
+  .\\nctl.exe report --folders "Target Group 1" "Target Group 2"
+  .\\nctl.exe report --folders 7,8,9 --merge
+  .\\nctl.exe report --all --merge --output D:\\ScanReports
+  .\\nctl.exe report --all --include-trash
+
+Mỗi scan xuất kết quả mới nhất thành một file CSV riêng, bật toàn bộ cột API hỗ trợ.
+Không lọc severity/host/plugin; không hỏi mật khẩu DB.
+Folder nhận ID hoặc tên, không phân biệt hoa thường; tên có dấu cách đặt trong ngoặc kép.
+--folders nhận nhiều giá trị cách bằng dấu cách hoặc dấu phẩy; scan/folder trùng chỉ xử lý một lần.
+--all bỏ qua Trash mặc định; --include-trash để lấy cả Trash.
+Chọn rõ scan ID hoặc folder Trash vẫn xuất các scan đó.
+Output mặc định: reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
+Tên file: scan-12_Ten scan.csv; manifest.json ghi các file và lỗi.
+--merge tạo thêm merged.csv từ toàn bộ CSV thành công của lượt chạy, giữ nguyên file lẻ.
+File gộp chỉ có một header ở dòng đầu; dữ liệu tất cả scan nối tiếp phía sau.
+Giữ nguyên dấu phẩy, dấu ngoặc kép, Unicode và nội dung xuống dòng trong ô.
+Nếu các CSV có cột khác nhau, lấy hợp tất cả cột, ánh xạ theo tên và để trống ô thiếu.
+File gộp dùng UTF-8 BOM để mở Unicode trong Excel.
+Lỗi một scan không dừng scan còn lại; exit code 2 nếu có lỗi export/gộp.
+Nếu scan nào thất bại, merged.csv chỉ chứa các scan xuất thành công; xem manifest.json.
+Scan chưa có kết quả hoặc không có quyền export có thể báo lỗi từ máy chủ.
 """,
     "restore": """Ví dụ:
   .\\nctl.exe restore .\\task1.db
