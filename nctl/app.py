@@ -18,7 +18,7 @@ from typing import Any, Sequence
 from . import __version__
 from .client import NctlClient, NctlError
 from .helptext import OVERVIEW, TOPICS
-from .report_excel import export_scan_xlsx, merge_scan_xlsx
+from .report_excel import export_scan_xlsx, merge_scan_xlsx, resolve_references_xlsx
 
 
 DEFAULT_URL = "https://127.0.0.1:11127"
@@ -524,6 +524,51 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                     f"({detail['column']}) dài {detail['original_length']} ký tự; "
                     f"đã giữ {detail['saved_length']} ký tự và highlight ô."
                 )
+            resolved = report_dir / "merged_resolved.xlsx"
+            print(f"Resolve URL nessus.org và tạo {resolved.name}...")
+            try:
+                resolved_result = resolve_references_xlsx(
+                    merged,
+                    resolved,
+                    existing_truncations=merge_result["truncated_details"],
+                    progress=lambda completed, total: print(
+                        f"  Resolve URL: {completed}/{total}"
+                    ),
+                )
+            except (NctlError, OSError) as exc:
+                manifest["errors"].append({
+                    "stage": "resolve_references", "file": resolved.name, "error": str(exc),
+                })
+                print(
+                    f"LỖI tạo {resolved.name} sau khi đã tạo thành công {merged.name}: {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                manifest["resolved"] = {
+                    "file": resolved.name,
+                    "rows": resolved_result["rows"],
+                    "source_file": merged.name,
+                    "references_column_after": "See Also",
+                    "urls_found": resolved_result["urls_found"],
+                    "unique_urls": resolved_result["unique_urls"],
+                    "resolved_urls": resolved_result["resolved_urls"],
+                    "rejected_urls": resolved_result["rejected_urls"],
+                    "status_counts": resolved_result["status_counts"],
+                    "resolution_details": resolved_result["resolution_details"],
+                    "truncated_cells": resolved_result["truncated_cells"],
+                    "truncated_details": resolved_result["truncated_details"],
+                }
+                print(
+                    f"Đã tạo {resolved}: tìm thấy {resolved_result['urls_found']} URL nessus.org "
+                    f"({resolved_result['unique_urls']} URL unique), resolve thành công "
+                    f"{resolved_result['resolved_urls']}, bỏ qua {resolved_result['rejected_urls']}."
+                )
+                for detail in resolved_result["truncated_details"]:
+                    print(
+                        f"  CẢNH BÁO {resolved.name}: ô {detail['cell']} "
+                        f"({detail['column']}) dài {detail['original_length']} ký tự; "
+                        f"đã giữ {detail['saved_length']} ký tự và highlight ô."
+                    )
         except (NctlError, OSError) as exc:
             manifest["errors"].append({"stage": "merge", "error": str(exc)})
             print(f"LỖI gộp Excel: {exc}", file=sys.stderr)
@@ -560,11 +605,13 @@ def cmd_merge_files(
         destination = destination.with_suffix(".xlsx")
     elif destination.suffix.casefold() != ".xlsx":
         raise NctlError("File output của lệnh merge phải có đuôi .xlsx.")
+    resolved_destination = destination.with_name(f"{destination.stem}_resolved.xlsx")
+    excluded_outputs = {destination.resolve(), resolved_destination.resolve()}
     candidates = sorted(
         (
             path for path in folder.iterdir()
             if path.is_file() and path.suffix.casefold() in {".csv", ".xlsx"}
-            and path.resolve() != destination
+            and path.resolve() not in excluded_outputs
         ),
         key=lambda path: path.name.casefold(),
     )
@@ -608,7 +655,50 @@ def cmd_merge_files(
         )
     print(
         f"Hoàn tất: đọc {input_rows} dòng; loại {duplicates_removed} dòng trùng; "
-        f"ghi {result['rows']} dòng vào {destination}. Manifest: {manifest_path}"
+        f"ghi {result['rows']} dòng vào {destination}."
+    )
+    print(f"Resolve URL nessus.org và tạo {resolved_destination.name}...")
+    try:
+        resolved_result = resolve_references_xlsx(
+            destination,
+            resolved_destination,
+            existing_truncations=result["truncated_details"],
+            progress=lambda completed, total: print(
+                f"  Resolve URL: {completed}/{total}"
+            ),
+        )
+    except (NctlError, OSError) as exc:
+        manifest["resolved_error"] = str(exc)
+        _write_manifest(manifest_path, manifest)
+        raise NctlError(
+            f"Đã tạo {destination}, nhưng không tạo được {resolved_destination}: {exc}"
+        ) from exc
+    manifest["resolved"] = {
+        "output": str(resolved_destination),
+        "rows": resolved_result["rows"],
+        "source_file": destination.name,
+        "references_column_after": "See Also",
+        "urls_found": resolved_result["urls_found"],
+        "unique_urls": resolved_result["unique_urls"],
+        "resolved_urls": resolved_result["resolved_urls"],
+        "rejected_urls": resolved_result["rejected_urls"],
+        "status_counts": resolved_result["status_counts"],
+        "resolution_details": resolved_result["resolution_details"],
+        "truncated_cells": resolved_result["truncated_cells"],
+        "truncated_details": resolved_result["truncated_details"],
+    }
+    _write_manifest(manifest_path, manifest)
+    for detail in resolved_result["truncated_details"]:
+        print(
+            f"  CẢNH BÁO {resolved_destination.name}: ô {detail['cell']} "
+            f"({detail['column']}) dài {detail['original_length']} ký tự; "
+            f"đã giữ {detail['saved_length']} ký tự và highlight ô."
+        )
+    print(
+        f"Đã tạo {resolved_destination}: tìm thấy {resolved_result['urls_found']} URL nessus.org "
+        f"({resolved_result['unique_urls']} URL unique), resolve thành công "
+        f"{resolved_result['resolved_urls']}, bỏ qua {resolved_result['rejected_urls']}. "
+        f"Manifest: {manifest_path}"
     )
     return 0
 

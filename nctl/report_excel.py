@@ -5,12 +5,17 @@ from __future__ import annotations
 import csv
 import posixpath
 import re
+import threading
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Iterator, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
+import requests
 import xlsxwriter
 from xlsxwriter.exceptions import XlsxWriterException
 from xlsxwriter.utility import xl_rowcol_to_cell
@@ -38,6 +43,9 @@ _STRUCTURED_LINE = re.compile(
     r"^(?:\s+|[-*•▪‣]\s+|\d+[.)]\s+|[A-Za-z][.)]\s+|https?://\S+$)", re.I
 )
 _SHORT_HEADING = re.compile(r"^.{1,80}:$")
+_URL = re.compile(r"https?://[^\s<>\"']+", re.I)
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_HTTP_LOCAL = threading.local()
 
 
 def _csv_header(reader: Any, path: Path) -> list[str]:
@@ -236,10 +244,17 @@ def _clean_excel_value(value: Any) -> tuple[str, int | None]:
 
 def _write_workbook(
     destination: Path, columns: Sequence[str], rows: Iterator[Sequence[Any]],
+    *, existing_truncations: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     partial = destination.with_suffix(destination.suffix + ".part")
     row_count = 0
     truncated_details: list[dict[str, Any]] = []
+    prior_truncations: dict[tuple[int, str], dict[str, Any]] = {}
+    for detail in existing_truncations or []:
+        match = re.search(r"(\d+)$", str(detail.get("cell", "")))
+        column = str(detail.get("column", ""))
+        if match and column:
+            prior_truncations[(int(match.group(1)), column)] = detail
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with xlsxwriter.Workbook(str(partial), {"constant_memory": True}) as workbook:
@@ -264,12 +279,19 @@ def _write_workbook(
                 for column, value in enumerate(row):
                     cleaned, original_length = _clean_excel_value(value)
                     current_format = cell_format
-                    if original_length is not None:
+                    prior_detail = prior_truncations.get((row_number + 1, columns[column]))
+                    if original_length is not None or prior_detail is not None:
                         truncated_details.append({
                             "cell": xl_rowcol_to_cell(row_number, column),
                             "column": columns[column],
-                            "original_length": original_length,
-                            "saved_length": EXCEL_CELL_LIMIT,
+                            "original_length": (
+                                original_length if original_length is not None
+                                else int(prior_detail["original_length"])
+                            ),
+                            "saved_length": (
+                                EXCEL_CELL_LIMIT if prior_detail is None
+                                else int(prior_detail.get("saved_length", EXCEL_CELL_LIMIT))
+                            ),
                         })
                         current_format = truncated_format
                     worksheet.write_string(row_number, column, cleaned, current_format)
@@ -287,6 +309,179 @@ def _write_workbook(
         "rows": row_count,
         "truncated_cells": len(truncated_details),
         "truncated_details": truncated_details,
+    }
+
+
+def _extract_nessus_urls(value: str) -> list[str]:
+    urls: list[str] = []
+    for match in _URL.finditer(str(value or "")):
+        url = match.group(0).rstrip(".,;)]}")
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").casefold()
+        if (host == "nessus.org" or host.endswith(".nessus.org")) and parsed.path.rstrip("/") == "/u":
+            urls.append(url)
+    return urls
+
+
+def _shortener_url(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit(("https", "api.tenable.com", "/v1/u", parsed.query, ""))
+
+
+def _http_session() -> requests.Session:
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "nctl-reference-resolver/2.6",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        })
+        _HTTP_LOCAL.session = session
+    return session
+
+
+def resolve_nessus_reference(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
+    """Resolve one Nessus short URL and reject a redirect from its target."""
+    endpoint = _shortener_url(url)
+    try:
+        with _http_session().get(
+            endpoint, allow_redirects=False, stream=True, timeout=timeout,
+        ) as short_response:
+            if short_response.status_code not in _REDIRECT_STATUSES:
+                return {
+                    "source_url": url, "status": "shortener_not_redirect",
+                    "http_status": short_response.status_code,
+                }
+            location = short_response.headers.get("Location", "").strip()
+            if not location:
+                return {"source_url": url, "status": "missing_location"}
+            target = urljoin(endpoint, location)
+        with _http_session().get(
+            target, allow_redirects=False, stream=True, timeout=timeout,
+        ) as target_response:
+            if target_response.status_code in _REDIRECT_STATUSES:
+                return {
+                    "source_url": url, "target_url": target,
+                    "status": "target_redirects_again",
+                    "http_status": target_response.status_code,
+                }
+            if not 200 <= target_response.status_code < 300:
+                return {
+                    "source_url": url, "target_url": target,
+                    "status": "target_unavailable",
+                    "http_status": target_response.status_code,
+                }
+        return {"source_url": url, "target_url": target, "status": "resolved"}
+    except requests.RequestException as exc:
+        return {
+            "source_url": url, "status": "request_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def resolve_references_xlsx(
+    source: Path,
+    destination: Path,
+    *,
+    existing_truncations: Sequence[dict[str, Any]] | None = None,
+    timeout: float = 10.0,
+    workers: int = 16,
+    resolver: Callable[[str], dict[str, Any]] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
+    """Create a second merged workbook with validated final URLs in References."""
+    if workers < 1:
+        raise NctlError("Số worker resolve URL phải lớn hơn 0.")
+    first_pass = iter(_xlsx_rows(source))
+    header = next((row for row in first_pass if any(row)), [])
+    if not header:
+        raise NctlError(f"Excel {source} không có header hợp lệ.")
+    see_also_index = next(
+        (index for index, name in enumerate(header) if name.casefold() == "see also"), None
+    )
+    # Different legacy schemes/hosts can point at the same Tenable short key.
+    # Resolve each canonical shortener endpoint only once.
+    ordered_urls: dict[str, str] = {}
+    occurrences = 0
+    if see_also_index is not None:
+        for row in first_pass:
+            value = row[see_also_index] if see_also_index < len(row) else ""
+            urls = _extract_nessus_urls(value)
+            occurrences += len(urls)
+            for url in urls:
+                ordered_urls.setdefault(_shortener_url(url), url)
+
+    resolve_one = resolver or (lambda url: resolve_nessus_reference(url, timeout=timeout))
+    results: dict[str, dict[str, Any]] = {}
+    total = len(ordered_urls)
+    if total:
+        with ThreadPoolExecutor(max_workers=min(workers, total)) as executor:
+            futures = {
+                executor.submit(resolve_one, url): canonical
+                for canonical, url in ordered_urls.items()
+            }
+            for completed, future in enumerate(as_completed(futures), 1):
+                canonical = futures[future]
+                url = ordered_urls[canonical]
+                try:
+                    results[canonical] = future.result()
+                except Exception as exc:  # Keep one resolver failure from aborting the workbook.
+                    results[canonical] = {
+                        "source_url": url, "status": "resolver_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                if progress is not None and (completed == total or completed % 25 == 0):
+                    progress(completed, total)
+
+    source_references_index = next(
+        (index for index, name in enumerate(header) if name.casefold() == "references"), None
+    )
+    columns = [name for name in header if name.casefold() != "references"]
+    output_see_also_index = next(
+        (index for index, name in enumerate(columns) if name.casefold() == "see also"), None
+    )
+    references_index = (
+        output_see_also_index + 1 if output_see_also_index is not None
+        else next((i for i, name in enumerate(columns) if name.casefold() == "cve"), len(columns))
+    )
+    columns.insert(references_index, "References")
+
+    def rows() -> Iterator[list[str]]:
+        table_rows = iter(_xlsx_rows(source))
+        current_header = next((row for row in table_rows if any(row)), [])
+        if current_header != header:
+            raise NctlError(f"Header Excel {source} đã thay đổi trong lúc resolve URL.")
+        for row_number, row in enumerate(table_rows, 2):
+            if not any(row) or row == header:
+                continue
+            row = _fit_row(row, header, source, row_number)
+            links: dict[str, None] = {}
+            if source_references_index is not None:
+                for link in str(row[source_references_index] or "").splitlines():
+                    if link.strip():
+                        links.setdefault(link.strip(), None)
+            if see_also_index is not None:
+                for url in _extract_nessus_urls(row[see_also_index]):
+                    result = results.get(_shortener_url(url), {})
+                    if result.get("status") == "resolved" and result.get("target_url"):
+                        links.setdefault(str(result["target_url"]), None)
+            if source_references_index is not None:
+                del row[source_references_index]
+            row.insert(references_index, "\n".join(links))
+            yield row
+
+    workbook_result = _write_workbook(
+        destination, columns, rows(), existing_truncations=existing_truncations,
+    )
+    status_counts = Counter(result.get("status", "unknown") for result in results.values())
+    return {
+        **workbook_result,
+        "urls_found": occurrences,
+        "unique_urls": total,
+        "resolved_urls": status_counts.get("resolved", 0),
+        "rejected_urls": total - status_counts.get("resolved", 0),
+        "status_counts": dict(sorted(status_counts.items())),
+        "resolution_details": [results[canonical] for canonical in ordered_urls],
     }
 
 

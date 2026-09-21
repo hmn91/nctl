@@ -39,7 +39,7 @@ Xuất report Excel đầy đủ cột, mỗi scan một file riêng (kết qu�
 ```
 
 Output mặc định trong `reports/nctl-report-.../`. Từ 2 scan thực tế trở lên chương trình tự tạo
-`merged.xlsx`, bất kể chọn bằng list scan, folder, nhiều folder hay `--all`. Với đúng 1 scan,
+`merged.xlsx` rồi `merged_resolved.xlsx`, bất kể chọn bằng list scan, folder, nhiều folder hay `--all`. Với đúng 1 scan,
 dùng `--merge` nếu vẫn muốn tạo file gộp;
 các file Excel riêng vẫn được giữ. Mỗi file riêng giữ nguyên thứ tự cột gốc và thêm `Group` ở cuối.
 File gộp đặt các cột đầu theo thứ tự `Source`, `Group`, `Name`, `Risk`, `Host`, `Location`,
@@ -63,6 +63,10 @@ Dòng khác ở bất kỳ cột nào ngoài `CVE` vẫn giữ riêng.
 Dòng giống nhau từ các scan khác nhau vẫn được giữ với `Source` tương ứng.
 Log và `manifest.json` ghi số dòng đọc, dòng trùng bị loại và dòng unique giữ lại cho từng scan và tổng.
 Chỉ `merged.xlsx` được lọc trùng khi dùng `--merge`; các file riêng giữ nguyên dữ liệu gốc.
+Sau khi tạo xong `merged.xlsx`, chương trình tạo thêm `merged_resolved.xlsx`. File thứ hai có cột
+`References` ngay sau `See Also`. Mỗi URL rút gọn `nessus.org/u?...` được chuẩn hóa và chỉ resolve một lần;
+URL đích chỉ được giữ nếu trả về HTTP 2xx và không redirect thêm lần nữa. URL hết hạn, lỗi kết nối hoặc còn
+redirect bị bỏ qua. Mỗi reference nằm trên một dòng trong cell. Kết quả và lý do bỏ URL được ghi trong manifest.
 `--all` bỏ qua Trash; thêm `--include-trash` để lấy cả Trash. Lỗi và thống kê nhóm được ghi vào `manifest.json`
 và trả exit code 2. Chi tiết: `nctl help report`.
 
@@ -75,8 +79,9 @@ Merge các report CSV/XLSX đã có mà không cần kết nối máy chủ:
 
 Lệnh đọc các file `.csv` và `.xlsx` ở cấp đầu tiên của thư mục. Nếu đã có `Source`, `Group`,
 `Location` hoặc `Description` tổng hợp thì giữ lại; cột thiếu được bổ sung theo cùng logic của
-`report --merge`. Khi thiếu `Source`, tên file được dùng làm nguồn. Output mặc định là
-`merged.xlsx` cùng `merged.manifest.json` trong thư mục đầu vào. Lệnh này chạy offline.
+`report --merge`. Khi thiếu `Source`, tên file được dùng làm nguồn. Output mặc định gồm `merged.xlsx`,
+`merged_resolved.xlsx` và `merged.manifest.json` trong thư mục đầu vào. Bước đọc/gộp file chạy offline;
+bước tạo file resolved cần kết nối Internet để kiểm tra URL đích.
 
 ## Phát triển
 

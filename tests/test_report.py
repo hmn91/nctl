@@ -13,7 +13,13 @@ import xlsxwriter
 
 from nctl.app import _merge_csv_files, _report_scans, build_parser, cmd_report, main
 from nctl.client import CSV_COLUMNS, NctlClient, NctlError
-from nctl.report_excel import export_scan_xlsx, merge_scan_xlsx, reflow_narrative
+from nctl.report_excel import (
+    export_scan_xlsx,
+    merge_scan_xlsx,
+    reflow_narrative,
+    resolve_nessus_reference,
+    resolve_references_xlsx,
+)
 from nctl.report_groups import add_group_column, group_for_finding
 
 
@@ -234,6 +240,94 @@ class GroupTests(unittest.TestCase):
 
 
 class ExcelReportTests(unittest.TestCase):
+    def test_resolve_nessus_reference_accepts_one_redirect_only(self):
+        class Response:
+            def __init__(self, status_code, location=None):
+                self.status_code = status_code
+                self.headers = {} if location is None else {"Location": location}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        session = Mock()
+        session.get.side_effect = [
+            Response(301, "https://vendor.example/advisory"),
+            Response(200),
+        ]
+        with patch("nctl.report_excel._http_session", return_value=session):
+            result = resolve_nessus_reference("http://www.nessus.org/u?abc123")
+        self.assertEqual(result, {
+            "source_url": "http://www.nessus.org/u?abc123",
+            "target_url": "https://vendor.example/advisory",
+            "status": "resolved",
+        })
+        self.assertEqual(session.get.call_args_list[0].args[0],
+                         "https://api.tenable.com/v1/u?abc123")
+        self.assertFalse(session.get.call_args_list[0].kwargs["allow_redirects"])
+        self.assertFalse(session.get.call_args_list[1].kwargs["allow_redirects"])
+
+        session.get.reset_mock()
+        session.get.side_effect = [
+            Response(301, "https://vendor.example/old"),
+            Response(302, "https://vendor.example/new"),
+        ]
+        with patch("nctl.report_excel._http_session", return_value=session):
+            rejected = resolve_nessus_reference("https://nessus.org/u?second")
+        self.assertEqual(rejected["status"], "target_redirects_again")
+
+    def test_resolved_workbook_places_references_immediately_after_see_also(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "merged.xlsx", root / "merged_resolved.xlsx"
+            write_xlsx(source, [[
+                "Source", "References", "Name", "See Also", "CVE", "Extra",
+            ], [
+                "Scan A", "https://existing.example/reference", "Finding",
+                "http://www.nessus.org/u?good\nhttps://nessus.org/u?dead\n"
+                "https://vendor.example/direct",
+                "CVE-1", "kept",
+            ], [
+                "Scan B", "", "Finding 2", "https://nessus.org/u?good", "", "also kept",
+            ]])
+
+            def resolver(url):
+                if url.endswith("?good"):
+                    return {
+                        "source_url": url,
+                        "target_url": "https://vendor.example/advisory",
+                        "status": "resolved",
+                    }
+                return {"source_url": url, "status": "target_unavailable", "http_status": 404}
+
+            progress = []
+            result = resolve_references_xlsx(
+                source, destination, resolver=resolver,
+                progress=lambda completed, total: progress.append((completed, total)),
+            )
+            self.assertEqual(read_xlsx(destination), [[
+                "Source", "Name", "See Also", "References", "CVE", "Extra",
+            ], [
+                "Scan A", "Finding",
+                "http://www.nessus.org/u?good\nhttps://nessus.org/u?dead\n"
+                "https://vendor.example/direct",
+                "https://existing.example/reference\nhttps://vendor.example/advisory",
+                "CVE-1", "kept",
+            ], [
+                "Scan B", "Finding 2", "https://nessus.org/u?good",
+                "https://vendor.example/advisory", "", "also kept",
+            ]])
+            self.assertEqual(result["urls_found"], 3)
+            self.assertEqual(result["unique_urls"], 2)
+            self.assertEqual(result["resolved_urls"], 1)
+            self.assertEqual(result["rejected_urls"], 1)
+            self.assertEqual(result["status_counts"], {
+                "resolved": 1, "target_unavailable": 1,
+            })
+            self.assertEqual(progress, [(2, 2)])
+
     def test_reflow_narrative_removes_soft_wraps_and_keeps_structure(self):
         source = (
             "It is possible to determine the exact time set on the remote host.\r\n\r\n"
@@ -561,6 +655,8 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(len(manifest["errors"]), int(fail))
                 self.assertEqual(client.export_csv.call_count, 3)
                 self.assertTrue((root / "merged.xlsx").exists())
+                self.assertTrue((root / "merged_resolved.xlsx").exists())
+                self.assertEqual(manifest["resolved"]["references_column_after"], "See Also")
                 for item in manifest["files"]:
                     original_rows = read_xlsx(root / item["file"])
                     self.assertEqual(original_rows[0], ["id", "Host", "Name", "Risk", "output", "Group"])
@@ -628,6 +724,7 @@ class ReportTests(unittest.TestCase):
                     self.assertEqual(cmd_report(client, args, {}), 0)
                 root = next(Path(directory).iterdir())
                 self.assertTrue((root / "merged.xlsx").exists())
+                self.assertTrue((root / "merged_resolved.xlsx").exists())
                 self.assertIn("Tự động bật merge", output.getvalue())
 
     def test_one_scan_does_not_auto_merge_without_option(self):
@@ -645,6 +742,7 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(cmd_report(client, args, {}), 0)
             root = next(Path(directory).iterdir())
             self.assertFalse((root / "merged.xlsx").exists())
+            self.assertFalse((root / "merged_resolved.xlsx").exists())
 
     def test_all_failed_exports_do_not_create_merged_excel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -691,8 +789,10 @@ class OfflineMergeTests(unittest.TestCase):
                 self.assertEqual(main(["merge", str(root)]), 0)
                 load_config.assert_not_called()
             merged = root / "merged.xlsx"
+            resolved = root / "merged_resolved.xlsx"
             manifest_path = root / "merged.manifest.json"
             self.assertTrue(merged.exists())
+            self.assertTrue(resolved.exists())
             self.assertTrue(manifest_path.exists())
             self.assertEqual(read_xlsx(merged), [
                 ["Source", "Group", "Name", "Risk", "Host", "Location", "Description",
@@ -709,6 +809,9 @@ class OfflineMergeTests(unittest.TestCase):
             self.assertEqual(manifest["mode"], "offline_merge")
             self.assertEqual(manifest["input_rows"], 3)
             self.assertEqual(manifest["duplicates_removed"], 1)
+            self.assertEqual(Path(manifest["resolved"]["output"]).resolve(), resolved.resolve())
+            resolved_header = read_xlsx(resolved)[0]
+            self.assertEqual(resolved_header[resolved_header.index("See Also") + 1], "References")
             self.assertIn("Merge offline 2 file", output.getvalue())
 
             # The current output is excluded when the command is run again.
@@ -717,6 +820,7 @@ class OfflineMergeTests(unittest.TestCase):
                 self.assertEqual(main(["merge", "--folder", str(root)]), 0)
                 load_config.assert_not_called()
             self.assertEqual(len(read_xlsx(merged)), 3)
+            self.assertEqual(len(read_xlsx(resolved)), 3)
 
     def test_merge_folder_requires_supported_input(self):
         with tempfile.TemporaryDirectory() as directory, \
