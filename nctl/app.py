@@ -18,6 +18,7 @@ from typing import Any, Sequence
 from . import __version__
 from .client import NctlClient, NctlError
 from .helptext import OVERVIEW, TOPICS
+from .report_groups import add_group_column
 
 
 DEFAULT_URL = "https://127.0.0.1:11127"
@@ -444,19 +445,30 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
     for index, scan in enumerate(selected, 1):
         scan_id = int(scan["id"])
         destination = report_dir / f"scan-{scan_id}_{_safe_name(scan.get('name') or 'scan')}.csv"
+        raw_destination = destination.with_suffix(destination.suffix + ".raw")
         print(f"[{index}/{len(selected)}] Scan {scan_id}: {scan.get('name', '-')}")
         try:
             client.export_csv(
-                scan_id, destination,
+                scan_id, raw_destination,
                 poll_interval=args.poll_interval, export_timeout=args.export_timeout,
             )
+            group_stats = add_group_column(raw_destination, destination)
             exported.append(destination)
             scan_name = str(scan.get("name") or f"scan-{scan_id}")
             scan_names.append(scan_name)
-            manifest["files"].append({"scan_id": scan_id, "scan_name": scan_name, "file": destination.name})
+            manifest["files"].append({
+                "scan_id": scan_id, "scan_name": scan_name, "file": destination.name,
+                **group_stats,
+            })
+            print(
+                f"  Group: {group_stats['rows']} dòng, {group_stats['groups']} nhóm; "
+                f"{group_stats['review_rows']} dòng cần xem lại."
+            )
         except (NctlError, OSError) as exc:
             manifest["errors"].append({"scan_id": scan_id, "error": str(exc)})
             print(f"LỖI scan {scan_id}: {exc}", file=sys.stderr)
+        finally:
+            raw_destination.unlink(missing_ok=True)
         _write_manifest(manifest_path, manifest)
     if args.merge:
         try:

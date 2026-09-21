@@ -10,6 +10,7 @@ import requests
 
 from nctl.app import _merge_csv_files, _report_scans, build_parser, cmd_report
 from nctl.client import CSV_COLUMNS, NctlClient, NctlError
+from nctl.report_groups import add_group_column, group_for_finding
 
 
 def write_csv(path, rows):
@@ -69,6 +70,124 @@ class SelectionTests(unittest.TestCase):
         args = build_parser().parse_args(["report", "--folder", "Group 2"])
         with self.assertRaisesRegex(NctlError, "folder ID"):
             _report_scans(self.client, args)
+
+
+class GroupTests(unittest.TestCase):
+    def test_name_patterns_cover_software_updates_without_a_package_allowlist(self):
+        cases = [
+            ("Ubuntu 22.04 LTS : Linux kernel vulnerabilities (USN-7510-1)",
+             "Security updates / Ubuntu / Linux kernel", {}),
+            ("Ubuntu 22.04 LTS : libexample vulnerabilities (USN-9999-1)",
+             "Security updates / Ubuntu / libexample", {}),
+            ("RHEL 8 : kernel:4.18.0 (RHSA-2025:1068)",
+             "Security updates / RHEL / kernel", {}),
+            ("RHEL 8 : Bug fix of NetworkManager (Moderate) (RHSA-2025:0288)",
+             "Security updates / RHEL / NetworkManager", {}),
+            ("RockyLinux 8 : libxml2 (RLSA-2025:10698)",
+             "Security updates / RockyLinux / libxml2", {}),
+            ("Security Updates for Microsoft .NET Framework (May 2020)",
+             "Security updates / Microsoft .NET Framework", {}),
+            ("Security Update for Windows Defender (May 2026) (CVE-2026-41091)",
+             "Security updates / Windows Defender", {}),
+            ("Security Updates for Microsoft Malware Protection Engine (July 2026)",
+             "Security updates / Microsoft Malware Protection Engine", {}),
+            ("KB5021237: Windows 10 version 1809 / Windows Server 2019 Security Update (December 2022)",
+             "Security updates / Windows OS", {}),
+            ("Google Chrome < 137.0.7151.40 Multiple Vulnerabilities",
+             "Security updates / Google Chrome", {"Solution": "Upgrade to Google Chrome version 137 or later."}),
+            ("Microsoft Edge (Chromium) < 137.0.3296.52 Multiple Vulnerabilities",
+             "Security updates / Microsoft Edge", {}),
+            ("Apache Log4j 2.0-beta9 < 2.25.3 MitM",
+             "Security updates / Apache Log4j", {"Solution": "Upgrade to Apache Log4j version 2.25.3."}),
+            ("Fortinet Fortigate Firewall deny policy bypass (FG-IR-23-432)",
+             "Security updates / Fortinet FortiGate",
+             {"Synopsis": "Fortinet Firewall is missing one or more security-related updates."}),
+            ("Notepad++ <= 8.9.3 Stack-based Buffer Overflow (CVE-2026-5525)",
+             "Security updates / Notepad++", {}),
+            ("Apache Tomcat 9.0.0.M1 < 9.0.105",
+             "Security updates / Apache Tomcat", {"Solution": "Upgrade to Apache Tomcat 9.0.105."}),
+            ("NVIDIA Container Toolkit 1.17.1 Multiple Vulnerabilities (2025_01)",
+             "Security updates / NVIDIA Container Toolkit", {"Solution": "Upgrade to NVIDIA Container Toolkit 1.17.1."}),
+            ("Trellix Agent < 5.8.1 Buffer Overflow Vulnerability (SB10416)",
+             "Security updates / Trellix Agent", {}),
+            ("IBM QRadar 7.5.x < 7.5.0 UP14 IF2 Information Disclosure (7253664)",
+             "Security updates / IBM QRadar SIEM", {"Solution": "Upgrade to IBM QRadar 7.5.0."}),
+            ("Apache Commons FileUpload < 1.6 , 2.0.0-M1 < 2.0.0-M4 Denial of Service (CVE-2025-48976)",
+             "Security updates / Apache Commons FileUpload", {}),
+            ("Windows Defender Antimalware/Antivirus Signature Definition Check",
+             "Security updates / Windows Defender", {"Solution": "Trigger an update manually."}),
+        ]
+        for name, expected, extras in cases:
+            with self.subTest(name=name):
+                self.assertEqual(group_for_finding({"Name": name, "Risk": "High", **extras}), expected)
+
+    def test_informational_configuration_review_and_none_risk_update(self):
+        self.assertEqual(
+            group_for_finding({"Name": "Ubuntu 22.04 LTS : Sudo vulnerability (USN-8092-1)",
+                               "Risk": "None", "Synopsis": "The host is missing a security update."}),
+            "Security updates / Ubuntu / Sudo",
+        )
+        self.assertEqual(group_for_finding({"Name": "Google Chrome Detection (Windows)", "Risk": "None"}),
+                         "Information / Google Chrome Detection (Windows)")
+        self.assertEqual(group_for_finding({"Name": "Apache Log4j Installed (Linux / Unix)", "Risk": "None"}),
+                         "Information / Apache Log4j Installed (Linux / Unix)")
+        self.assertEqual(group_for_finding({"Name": "SSL Certificate Cannot Be Trusted", "Risk": "Medium"}),
+                         "Configuration / SSL Certificate Cannot Be Trusted")
+        self.assertEqual(group_for_finding({"Name": "Unknown Vendor Finding", "Risk": "High", "Plugin ID": "42"}),
+                         "Cần xem lại / Plugin 42")
+        self.assertEqual(group_for_finding({
+            "Name": "Foo Connector issue", "Risk": "High",
+            "Solution": "Upgrade to Foo Connector version 1.2 or later.",
+            "Plugin Output": "Installed version : 1.0\nFixed version : 1.2",
+        }), "Security updates / Foo Connector")
+        self.assertEqual(group_for_finding({
+            "Name": "Foo Connector issue", "Risk": "High", "Plugin ID": "43",
+            "Solution": "Upgrade to Foo Connector version 1.2 or later.",
+        }), "Cần xem lại / Plugin 43")
+        self.assertEqual(
+            group_for_finding({"Name": "Google Chrome < 137.0 Multiple Vulnerabilities",
+                               "Risk": "High", "Host": "192.0.2.99", "Source": "Another scan"}),
+            group_for_finding({"Name": "Google Chrome < 137.0 Multiple Vulnerabilities",
+                               "Risk": "High", "Host": "192.0.2.1", "Source": "First scan"}),
+        )
+
+    def test_add_group_column_preserves_rows_and_uses_atomic_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "raw.csv", root / "scan.csv"
+            header = ["Plugin ID", "Risk", "Name", "Host", "Plugin Output"]
+            rows = [
+                ["1", "High", "Google Chrome < 137.0 Multiple Vulnerabilities", "192.0.2.1", "line 1\nline 2, quoted"],
+                ["2", "High", "Google Chrome < 138.0 Multiple Vulnerabilities", "192.0.2.2", "other"],
+                ["3", "None", "Google Chrome Detection (Windows)", "192.0.2.1", "detected"],
+            ]
+            write_csv(source, [header, *rows])
+            original = source.read_bytes()
+            self.assertEqual(add_group_column(source, destination),
+                             {"rows": 3, "groups": 2, "review_rows": 0})
+            self.assertEqual(read_csv(destination), [
+                [*header, "Group"],
+                [*rows[0], "Security updates / Google Chrome"],
+                [*rows[1], "Security updates / Google Chrome"],
+                [*rows[2], "Information / Google Chrome Detection (Windows)"],
+            ])
+            self.assertEqual(source.read_bytes(), original)
+            self.assertFalse((root / "scan.csv.part").exists())
+
+    def test_bad_csv_keeps_previous_output_and_removes_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "raw.csv", root / "scan.csv"
+            source.write_text('Name,Risk\n"unfinished,High\n', encoding="utf-8")
+            destination.write_bytes(b"previous")
+            with self.assertRaises(NctlError):
+                add_group_column(source, destination)
+            self.assertEqual(destination.read_bytes(), b"previous")
+            self.assertFalse((root / "scan.csv.part").exists())
+            write_csv(source, [["Risk", "Plugin ID"], ["High", "42"]])
+            with self.assertRaisesRegex(NctlError, "header"):
+                add_group_column(source, destination)
+            self.assertEqual(destination.read_bytes(), b"previous")
 
 
 class MergeTests(unittest.TestCase):
@@ -208,8 +327,10 @@ class ReportTests(unittest.TestCase):
                 def export(scan_id, destination, **kwargs):
                     if fail and scan_id == 2:
                         raise NctlError("Export failed")
-                    row = [str(scan_id), "192.0.2.1", "data\nmore"]
-                    write_csv(destination, [["id", "Host", "output"], row, row])
+                    name = ("Microsoft Edge (Chromium) < 137.0 Multiple Vulnerabilities"
+                            if scan_id == 2 else "Google Chrome < 137.0 Multiple Vulnerabilities")
+                    row = [str(scan_id), f"192.0.2.{scan_id}", name, "High", "data\nmore"]
+                    write_csv(destination, [["id", "Host", "Name", "Risk", "output"], row, row])
 
                 client.export_csv.side_effect = export
                 args = build_parser().parse_args([
@@ -226,8 +347,14 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual((root / "merged.csv").exists(), merge)
                 for item in manifest["files"]:
                     original_rows = read_csv(root / item["file"])
-                    self.assertEqual(original_rows[0], ["id", "Host", "output"])
+                    self.assertEqual(original_rows[0], ["id", "Host", "Name", "Risk", "output", "Group"])
                     self.assertEqual(len(original_rows), 3)
+                    self.assertEqual(original_rows[1][-1],
+                                     "Security updates / Microsoft Edge" if item["scan_id"] == 2
+                                     else "Security updates / Google Chrome")
+                    self.assertEqual(item["rows"], 2)
+                    self.assertEqual(item["groups"], 1)
+                self.assertFalse(list(root.glob("*.raw")))
                 if merge:
                     self.assertEqual(manifest["merged"]["rows"], 2 if fail else 3)
                     self.assertEqual(manifest["merged"]["input_rows"], 4 if fail else 6)
@@ -239,9 +366,14 @@ class ReportTests(unittest.TestCase):
                         "đọc 6 dòng dữ liệu; loại 3 dòng trùng; giữ 3 dòng unique", output.getvalue(),
                     )
                     self.assertEqual(read_csv(root / "merged.csv"), [
-                        ["Source", "id", "Host", "output"], ["Quét/Linux", "1", "192.0.2.1", "data\nmore"],
-                        *([] if fail else [['Windows, "weekly"', "2", "192.0.2.1", "data\nmore"]]),
-                        ["Quét:Linux", "3", "192.0.2.1", "data\nmore"],
+                        ["Source", "id", "Host", "Name", "Risk", "output", "Group"],
+                        ["Quét/Linux", "1", "192.0.2.1", "Google Chrome < 137.0 Multiple Vulnerabilities",
+                         "High", "data\nmore", "Security updates / Google Chrome"],
+                        *([] if fail else [["Windows, \"weekly\"", "2", "192.0.2.2",
+                                             "Microsoft Edge (Chromium) < 137.0 Multiple Vulnerabilities",
+                                             "High", "data\nmore", "Security updates / Microsoft Edge"]]),
+                        ["Quét:Linux", "3", "192.0.2.3", "Google Chrome < 137.0 Multiple Vulnerabilities",
+                         "High", "data\nmore", "Security updates / Google Chrome"],
                     ])
 
     def test_all_failed_exports_do_not_create_merged_csv(self):

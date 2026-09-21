@@ -104,6 +104,14 @@ Lỗi một history không dừng phần còn lại; exit code khác 0 nếu có
   .\\nctl.exe report --all --include-trash
 
 Mỗi scan xuất kết quả mới nhất thành một file CSV riêng, bật toàn bộ cột API hỗ trợ.
+Mỗi CSV tự thêm cột Group, kể cả khi không dùng --merge; file gộp cũng giữ Group.
+Group không chứa host hay tên scan: lọc Group trên mọi host, rồi lọc Host/Source nếu cần.
+Tên nhóm phần mềm bắt đầu bằng "Security updates /", ví dụ Ubuntu / Linux kernel,
+Microsoft .NET Framework, Google Chrome, Apache Log4j, Fortinet FortiGate.
+Tên phần mềm được lấy từ tên plugin, không giới hạn ở một danh sách package cố định.
+Với tên chưa rõ, có thể xác nhận sản phẩm bằng Solution và phiên bản trong Plugin Output.
+Phát hiện cấu hình có tiền tố "Configuration /"; thông tin có "Information /".
+Trường hợp thiếu bằng chứng dùng "Cần xem lại / Plugin <ID>" để tránh gộp sai.
 Không lọc severity/host/plugin; không hỏi mật khẩu DB.
 Folder nhận ID hoặc tên, không phân biệt hoa thường; tên có dấu cách đặt trong ngoặc kép.
 --folders nhận nhiều giá trị cách bằng dấu cách hoặc dấu phẩy; scan/folder trùng chỉ xử lý một lần.
