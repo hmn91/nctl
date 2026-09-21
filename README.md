@@ -1,6 +1,6 @@
 # nctl
 
-Công cụ dòng lệnh quản lý máy chủ quét: list scan/history, report CSV, backup/restore `.db`, tạo task và monitor.
+Công cụ dòng lệnh quản lý máy chủ quét: list scan/history, report Excel, backup/restore `.db`, tạo task và monitor.
 
 ## Bắt đầu
 
@@ -26,9 +26,9 @@ Mọi hướng dẫn, ví dụ và lưu ý an toàn được tích hợp trong c
 
 Bản Windows portable không cần Python. Khi chạy mã nguồn: `python nctl.py help` hoặc `python -m nctl help`.
 
-## Report CSV
+## Report Excel
 
-Xuất report CSV đầy đủ cột, mỗi scan một file riêng (kết quả mới nhất):
+Xuất report Excel đầy đủ cột, mỗi scan một file riêng (kết quả mới nhất):
 
 ```powershell
 .\nctl.exe report --scan 12
@@ -38,9 +38,18 @@ Xuất report CSV đầy đủ cột, mỗi scan một file riêng (kết quả 
 .\nctl.exe report --all --merge
 ```
 
-Output mặc định trong `reports/nctl-report-.../`. `--merge` tạo thêm `merged.csv`
-với một header ở đầu và dữ liệu nối tiếp của các CSV xuất thành công; giữ nguyên file lẻ.
-Mỗi CSV đều có cột `Group`, kể cả khi không dùng `--merge`; file gộp cũng giữ cột này.
+Output mặc định trong `reports/nctl-report-.../`. Từ 2 scan thực tế trở lên chương trình tự tạo
+`merged.xlsx`, bất kể chọn bằng list scan, folder, nhiều folder hay `--all`. Với đúng 1 scan,
+dùng `--merge` nếu vẫn muốn tạo file gộp;
+các file Excel riêng vẫn được giữ. Mỗi file riêng giữ nguyên thứ tự cột gốc và thêm `Group` ở cuối.
+File gộp đặt các cột đầu theo thứ tự `Source`, `Group`, `Name`, `Risk`, `Host`, `Location`,
+`Description`, `Solution`, `Plugin Output`, `See Also`, `CVE`, rồi đến các cột còn lại.
+Chỉ trong file gộp, `Location` ghép `Protocol/Port`; `Description` ghép `Synopsis`, một dòng trống,
+rồi `Description` gốc. Tất cả ô được căn trên và tắt Wrap Text.
+Trong file merge, các xuống dòng đơn dùng để wrap nội dung web được nối lại trong `Synopsis`,
+`Description` và `Solution`; đoạn trống, bullet, danh sách, URL và khối thụt dòng được giữ nguyên.
+Hàng header được in đậm, freeze ở trên cùng và bật sẵn Filter. Ô vượt giới hạn 32.767 ký tự
+của Excel được rút gọn, highlight, in cảnh báo ra terminal và ghi chi tiết vào `manifest.json`.
 Group chỉ mô tả nguyên nhân/thành phần (ví dụ `Security updates / Ubuntu / Linux kernel`
 hoặc `Security updates / Microsoft .NET Framework`), không chứa host hay tên scan.
 Tên group ưu tiên tên plugin; trường hợp tên chưa rõ cần bằng chứng phiên bản trong
@@ -48,14 +57,26 @@ Tên group ưu tiên tên plugin; trường hợp tên chưa rõ cần bằng ch
 Lọc thêm `Host` hoặc `Source` để thu hẹp phạm vi. Trường hợp chưa rõ được ghi
 `Cần xem lại / Plugin <ID>`; dữ liệu gốc và thứ tự dòng được giữ nguyên.
 Cột `Source` ở đầu file gộp chứa tên scan sinh ra từng dòng, giúp lọc các IP trùng giữa scan.
-Khi gộp, các dòng giống ở mọi cột ngoài `CVE` trong từng CSV được gom thành một dòng,
+Khi gộp, các dòng giống ở mọi cột ngoài `CVE` trong từng scan được gom thành một dòng,
 theo thứ tự ban đầu; ô `CVE` chứa toàn bộ CVE khác nhau, phân cách bằng `; `.
 Dòng khác ở bất kỳ cột nào ngoài `CVE` vẫn giữ riêng.
 Dòng giống nhau từ các scan khác nhau vẫn được giữ với `Source` tương ứng.
-Log và `manifest.json` ghi số dòng đọc, dòng trùng bị loại và dòng unique giữ lại cho từng CSV và tổng.
-Chỉ `merged.csv` được lọc trùng khi dùng `--merge`; các CSV lẻ giữ nguyên dữ liệu gốc.
+Log và `manifest.json` ghi số dòng đọc, dòng trùng bị loại và dòng unique giữ lại cho từng scan và tổng.
+Chỉ `merged.xlsx` được lọc trùng khi dùng `--merge`; các file riêng giữ nguyên dữ liệu gốc.
 `--all` bỏ qua Trash; thêm `--include-trash` để lấy cả Trash. Lỗi và thống kê nhóm được ghi vào `manifest.json`
 và trả exit code 2. Chi tiết: `nctl help report`.
+
+Merge các report CSV/XLSX đã có mà không cần kết nối máy chủ:
+
+```powershell
+.\nctl.exe merge .\existing-reports
+.\nctl.exe merge --folder D:\ScanReports --output D:\Combined\report.xlsx
+```
+
+Lệnh đọc các file `.csv` và `.xlsx` ở cấp đầu tiên của thư mục. Nếu đã có `Source`, `Group`,
+`Location` hoặc `Description` tổng hợp thì giữ lại; cột thiếu được bổ sung theo cùng logic của
+`report --merge`. Khi thiếu `Source`, tên file được dùng làm nguồn. Output mặc định là
+`merged.xlsx` cùng `merged.manifest.json` trong thư mục đầu vào. Lệnh này chạy offline.
 
 ## Phát triển
 

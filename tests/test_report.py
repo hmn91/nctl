@@ -3,13 +3,17 @@ import io
 import json
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
+import xlsxwriter
 
-from nctl.app import _merge_csv_files, _report_scans, build_parser, cmd_report
+from nctl.app import _merge_csv_files, _report_scans, build_parser, cmd_report, main
 from nctl.client import CSV_COLUMNS, NctlClient, NctlError
+from nctl.report_excel import export_scan_xlsx, merge_scan_xlsx, reflow_narrative
 from nctl.report_groups import add_group_column, group_for_finding
 
 
@@ -21,6 +25,45 @@ def write_csv(path, rows):
 def read_csv(path):
     with path.open(encoding="utf-8-sig", newline="") as source:
         return list(csv.reader(source))
+
+
+def read_xlsx(path):
+    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    with zipfile.ZipFile(path) as archive:
+        shared = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            shared = ["".join(node.text or "" for node in item.findall(".//x:t", namespace))
+                      for item in root.findall("x:si", namespace)]
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    rows = []
+    for xml_row in sheet.findall(".//x:sheetData/x:row", namespace):
+        values = []
+        for cell in xml_row.findall("x:c", namespace):
+            reference = cell.attrib["r"]
+            letters = "".join(character for character in reference if character.isalpha())
+            column = 0
+            for letter in letters:
+                column = column * 26 + ord(letter.upper()) - 64
+            while len(values) < column - 1:
+                values.append("")
+            if cell.attrib.get("t") == "inlineStr":
+                value = "".join(node.text or "" for node in cell.findall(".//x:t", namespace))
+            else:
+                node = cell.find("x:v", namespace)
+                raw = node.text if node is not None and node.text is not None else ""
+                value = shared[int(raw)] if cell.attrib.get("t") == "s" and raw else raw
+            values.append(value)
+        rows.append(values)
+    return rows
+
+
+def write_xlsx(path, rows):
+    with xlsxwriter.Workbook(str(path)) as workbook:
+        worksheet = workbook.add_worksheet("Data")
+        for row_number, row in enumerate(rows):
+            for column, value in enumerate(row):
+                worksheet.write_string(row_number, column, value)
 
 
 class SelectionTests(unittest.TestCase):
@@ -190,6 +233,149 @@ class GroupTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"previous")
 
 
+class ExcelReportTests(unittest.TestCase):
+    def test_reflow_narrative_removes_soft_wraps_and_keeps_structure(self):
+        source = (
+            "It is possible to determine the exact time set on the remote host.\r\n\r\n"
+            "The remote host answers to an ICMP timestamp request.  This allows an\r\n"
+            "attacker to know the date that is set on the targeted machine, which\r\n"
+            "may assist an unauthenticated, remote attacker.\r\n\r\n"
+            "Timestamps returned from Windows Vista / 7 / 2008 /\r\n"
+            "2008 R2 are deliberately incorrect."
+        )
+        self.assertEqual(reflow_narrative(source), (
+            "It is possible to determine the exact time set on the remote host.\n\n"
+            "The remote host answers to an ICMP timestamp request. This allows an "
+            "attacker to know the date that is set on the targeted machine, which "
+            "may assist an unauthenticated, remote attacker.\n\n"
+            "Timestamps returned from Windows Vista / 7 / 2008 / 2008 R2 are deliberately incorrect."
+        ))
+        structured = (
+            "Actions:\n- Install the update\n- Restart the service\n\n"
+            "https://example.test/advisory\nhttps://example.test/fix\n\n"
+            "    command --flag\n    output"
+        )
+        self.assertEqual(reflow_narrative(structured), structured)
+
+    def test_reflow_only_changes_merged_narrative_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raw.csv"
+            scan = root / "scan.xlsx"
+            merged = root / "merged.xlsx"
+            description = "First sentence continues on the\nnext display line.\n\nSecond paragraph."
+            solution = "Upgrade the affected\npackage to the latest version."
+            plugin_output = "package: old\npackage: fixed"
+            write_csv(source, [
+                ["Name", "Risk", "Synopsis", "Description", "Solution", "Plugin Output"],
+                ["Detection", "None", "Short summary", description, solution, plugin_output],
+            ])
+            export_scan_xlsx(source, scan)
+            self.assertEqual(read_xlsx(scan)[1][3], description)
+            self.assertEqual(read_xlsx(scan)[1][4], solution)
+            self.assertEqual(read_xlsx(scan)[1][5], plugin_output)
+            merge_scan_xlsx([source], merged, ["Scan"])
+            row = dict(zip(read_xlsx(merged)[0], read_xlsx(merged)[1]))
+            self.assertEqual(
+                row["Description"],
+                "Short summary\n\nFirst sentence continues on the next display line.\n\nSecond paragraph.",
+            )
+            self.assertEqual(row["Solution"], "Upgrade the affected package to the latest version.")
+            self.assertEqual(row["Plugin Output"], plugin_output)
+
+    def test_scan_workbook_preserves_original_columns_and_appends_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "raw.csv", root / "scan.xlsx"
+            header = ["Plugin ID", "CVE", "Protocol", "Port", "Name", "Synopsis", "Description", "Risk"]
+            row = ["1", "CVE-1", "tcp", "443", "Google Chrome < 2 Multiple Vulnerabilities",
+                   "Short summary", "Long description", "High"]
+            write_csv(source, [header, row])
+            result = export_scan_xlsx(source, destination)
+            self.assertEqual(result, {
+                "rows": 1, "truncated_cells": 0, "truncated_details": [],
+                "groups": 1, "review_rows": 0,
+            })
+            self.assertEqual(read_xlsx(destination), [
+                [*header, "Group"], [*row, "Security updates / Google Chrome"],
+            ])
+
+    def test_merged_workbook_reorders_combines_and_consolidates_cves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "raw.csv", root / "merged.xlsx"
+            header = ["Plugin ID", "CVE", "Risk", "Host", "Protocol", "Port", "Name",
+                      "Synopsis", "Description", "Solution", "See Also", "Plugin Output", "Score"]
+            common = ["1", "High", "192.0.2.1", "tcp", "443",
+                      "Google Chrome < 2 Multiple Vulnerabilities", "Short summary", "Long description",
+                      "Upgrade", "https://example.test", "line 1\nline 2", "9.8"]
+            write_csv(source, [header, [common[0], "CVE-1", *common[1:]],
+                                       [common[0], "CVE-2", *common[1:]]])
+            statistics = []
+            result = merge_scan_xlsx([source], destination, ["Weekly Scan"], statistics=statistics,
+                                     file_names=["scan-1.xlsx"])
+            self.assertEqual(result, {"rows": 1, "truncated_cells": 0, "truncated_details": []})
+            self.assertEqual(read_xlsx(destination), [
+                ["Source", "Group", "Name", "Risk", "Host", "Location", "Description", "Solution",
+                 "Plugin Output", "See Also", "CVE", "Plugin ID", "Score"],
+                ["Weekly Scan", "Security updates / Google Chrome",
+                 "Google Chrome < 2 Multiple Vulnerabilities", "High", "192.0.2.1", "tcp/443",
+                 "Short summary\n\nLong description", "Upgrade", "line 1\nline 2",
+                 "https://example.test", "CVE-1; CVE-2", "1", "9.8"],
+            ])
+            self.assertEqual(statistics, [{
+                "file": "scan-1.xlsx", "scan_name": "Weekly Scan", "input_rows": 2,
+                "unique_rows": 1, "duplicates_removed": 1,
+            }])
+
+    def test_excel_header_and_sheet_navigation_formatting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "raw.csv", root / "scan.xlsx"
+            write_csv(source, [["Name", "Risk", "Plugin Output"],
+                               ["Detection", "None", "first\nsecond"]])
+            export_scan_xlsx(source, destination)
+            namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            with zipfile.ZipFile(destination) as archive:
+                sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                styles = ET.fromstring(archive.read("xl/styles.xml"))
+            xfs = styles.findall(".//x:cellXfs/x:xf", namespace)
+            fonts = styles.findall(".//x:fonts/x:font", namespace)
+            for cell in sheet.findall(".//x:sheetData/x:row/x:c", namespace):
+                alignment = xfs[int(cell.attrib["s"])].find("x:alignment", namespace)
+                self.assertIsNotNone(alignment)
+                self.assertEqual(alignment.attrib.get("vertical"), "top")
+                self.assertNotEqual(alignment.attrib.get("wrapText"), "1")
+            header_cell = sheet.find(".//x:sheetData/x:row[@r='1']/x:c", namespace)
+            header_style = xfs[int(header_cell.attrib["s"])]
+            self.assertIsNotNone(fonts[int(header_style.attrib["fontId"])].find("x:b", namespace))
+            pane = sheet.find(".//x:sheetViews/x:sheetView/x:pane", namespace)
+            self.assertEqual(pane.attrib.get("state"), "frozen")
+            self.assertEqual(pane.attrib.get("ySplit"), "1")
+            self.assertEqual(sheet.find("x:autoFilter", namespace).attrib["ref"], "A1:D2")
+
+    def test_excel_cell_limit_is_counted_and_truncated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "raw.csv", root / "scan.xlsx"
+            write_csv(source, [["Name", "Risk", "Plugin Output"],
+                               ["Detection", "None", "x" * 40000]])
+            result = export_scan_xlsx(source, destination)
+            self.assertEqual(result["truncated_cells"], 1)
+            self.assertEqual(result["truncated_details"], [{
+                "cell": "C2", "column": "Plugin Output", "original_length": 40000,
+                "saved_length": 32767,
+            }])
+            self.assertEqual(len(read_xlsx(destination)[1][2]), 32767)
+            namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            with zipfile.ZipFile(destination) as archive:
+                sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                styles = ET.fromstring(archive.read("xl/styles.xml"))
+            cell = sheet.find(".//x:c[@r='C2']", namespace)
+            style = styles.findall(".//x:cellXfs/x:xf", namespace)[int(cell.attrib["s"])]
+            self.assertNotEqual(style.attrib.get("fillId"), "0")
+
+
 class MergeTests(unittest.TestCase):
     def test_combines_cves_only_when_every_other_column_matches(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -313,6 +499,36 @@ class MergeTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_truncated_cell_is_logged_and_recorded_in_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = Mock(url="https://scanner.example")
+            client.list_folders.return_value = []
+            client.list_scans.return_value = {"scans": [{"id": 1, "name": "Weekly"}]}
+            client.export_csv.side_effect = lambda scan_id, destination, **kwargs: write_csv(
+                destination,
+                [["Name", "Risk", "Plugin Output"], ["Detection", "None", "x" * 40000]],
+            )
+            args = build_parser().parse_args([
+                "report", "--all", "--merge", "--output", directory,
+            ])
+            output = io.StringIO()
+            with patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
+                self.assertEqual(cmd_report(client, args, {}), 0)
+            root = next(Path(directory).iterdir())
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            detail = manifest["files"][0]["truncated_details"][0]
+            self.assertEqual(detail, {
+                "cell": "C2", "column": "Plugin Output", "original_length": 40000,
+                "saved_length": 32767,
+            })
+            self.assertEqual(manifest["merged"]["truncated_details"], [{
+                "cell": "I2", "column": "Plugin Output", "original_length": 40000,
+                "saved_length": 32767,
+            }])
+            self.assertIn("CẢNH BÁO", output.getvalue())
+            self.assertIn("ô C2 (Plugin Output) dài 40000 ký tự", output.getvalue())
+            self.assertIn("ô I2 (Plugin Output) dài 40000 ký tự", output.getvalue())
+
     def test_separate_files_optional_merge_and_partial_export_failure(self):
         for merge, fail in ((False, False), (True, False), (True, True)):
             with self.subTest(merge=merge, fail=fail), tempfile.TemporaryDirectory() as directory:
@@ -344,9 +560,9 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(len(manifest["files"]), 2 if fail else 3)
                 self.assertEqual(len(manifest["errors"]), int(fail))
                 self.assertEqual(client.export_csv.call_count, 3)
-                self.assertEqual((root / "merged.csv").exists(), merge)
+                self.assertTrue((root / "merged.xlsx").exists())
                 for item in manifest["files"]:
-                    original_rows = read_csv(root / item["file"])
+                    original_rows = read_xlsx(root / item["file"])
                     self.assertEqual(original_rows[0], ["id", "Host", "Name", "Risk", "output", "Group"])
                     self.assertEqual(len(original_rows), 3)
                     self.assertEqual(original_rows[1][-1],
@@ -355,28 +571,82 @@ class ReportTests(unittest.TestCase):
                     self.assertEqual(item["rows"], 2)
                     self.assertEqual(item["groups"], 1)
                 self.assertFalse(list(root.glob("*.raw")))
-                if merge:
-                    self.assertEqual(manifest["merged"]["rows"], 2 if fail else 3)
-                    self.assertEqual(manifest["merged"]["input_rows"], 4 if fail else 6)
-                    self.assertEqual(manifest["merged"]["duplicates_removed"], 2 if fail else 3)
-                    self.assertEqual(len(manifest["merged"]["files"]), 2 if fail else 3)
-                    self.assertIn("đọc 2 dòng dữ liệu; loại 1 dòng trùng; giữ 1 dòng unique", output.getvalue())
-                    self.assertIn(
-                        "đọc 4 dòng dữ liệu; loại 2 dòng trùng; giữ 2 dòng unique" if fail else
-                        "đọc 6 dòng dữ liệu; loại 3 dòng trùng; giữ 3 dòng unique", output.getvalue(),
-                    )
-                    self.assertEqual(read_csv(root / "merged.csv"), [
-                        ["Source", "id", "Host", "Name", "Risk", "output", "Group"],
-                        ["Quét/Linux", "1", "192.0.2.1", "Google Chrome < 137.0 Multiple Vulnerabilities",
-                         "High", "data\nmore", "Security updates / Google Chrome"],
-                        *([] if fail else [["Windows, \"weekly\"", "2", "192.0.2.2",
-                                             "Microsoft Edge (Chromium) < 137.0 Multiple Vulnerabilities",
-                                             "High", "data\nmore", "Security updates / Microsoft Edge"]]),
-                        ["Quét:Linux", "3", "192.0.2.3", "Google Chrome < 137.0 Multiple Vulnerabilities",
-                         "High", "data\nmore", "Security updates / Google Chrome"],
-                    ])
+                self.assertEqual(manifest["merged"]["rows"], 2 if fail else 3)
+                self.assertEqual(manifest["merged"]["input_rows"], 4 if fail else 6)
+                self.assertEqual(manifest["merged"]["duplicates_removed"], 2 if fail else 3)
+                self.assertEqual(len(manifest["merged"]["files"]), 2 if fail else 3)
+                self.assertIn("đọc 2 dòng dữ liệu; loại 1 dòng trùng; giữ 1 dòng unique", output.getvalue())
+                self.assertIn(
+                    "đọc 4 dòng dữ liệu; loại 2 dòng trùng; giữ 2 dòng unique" if fail else
+                    "đọc 6 dòng dữ liệu; loại 3 dòng trùng; giữ 3 dòng unique", output.getvalue(),
+                )
+                self.assertEqual(read_xlsx(root / "merged.xlsx"), [
+                    ["Source", "Group", "Name", "Risk", "Host", "Location", "Description",
+                     "Solution", "Plugin Output", "See Also", "CVE", "id", "output"],
+                    ["Quét/Linux", "Security updates / Google Chrome",
+                     "Google Chrome < 137.0 Multiple Vulnerabilities", "High", "192.0.2.1",
+                     "", "", "", "", "", "", "1", "data\nmore"],
+                    *([] if fail else [["Windows, \"weekly\"", "Security updates / Microsoft Edge",
+                                         "Microsoft Edge (Chromium) < 137.0 Multiple Vulnerabilities",
+                                         "High", "192.0.2.2", "", "", "", "", "", "", "2",
+                                         "data\nmore"]]),
+                    ["Quét:Linux", "Security updates / Google Chrome",
+                     "Google Chrome < 137.0 Multiple Vulnerabilities", "High", "192.0.2.3",
+                    "", "", "", "", "", "", "3", "data\nmore"],
+                ])
 
-    def test_all_failed_exports_do_not_create_merged_csv(self):
+    def test_two_resolved_scans_auto_merge_for_all_selector_types(self):
+        cases = [
+            ["--scans", "1,2,1"],
+            ["--folder", "Team A"],
+            ["--folders", "Team A", "Empty"],
+            ["--all"],
+        ]
+        for flags in cases:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
+                client = Mock(url="https://scanner.example")
+                client.list_folders.return_value = [
+                    {"id": 7, "name": "Team A", "type": "custom"},
+                    {"id": 8, "name": "Empty", "type": "custom"},
+                ]
+                scans = [
+                    {"id": 1, "name": "One", "folder_id": 7},
+                    {"id": 2, "name": "Two", "folder_id": 7},
+                ]
+                client.list_scans.side_effect = lambda folder_id=None: {
+                    "scans": scans if folder_id is None or folder_id == 7 else [],
+                }
+                client.export_csv.side_effect = lambda scan_id, destination, **kwargs: write_csv(
+                    destination,
+                    [["Name", "Risk"], [f"Detection {scan_id}", "None"]],
+                )
+                args = build_parser().parse_args([
+                    "report", *flags, "--output", directory,
+                ])
+                output = io.StringIO()
+                with patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
+                    self.assertEqual(cmd_report(client, args, {}), 0)
+                root = next(Path(directory).iterdir())
+                self.assertTrue((root / "merged.xlsx").exists())
+                self.assertIn("Tự động bật merge", output.getvalue())
+
+    def test_one_scan_does_not_auto_merge_without_option(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = Mock(url="https://scanner.example")
+            client.list_folders.return_value = []
+            client.list_scans.return_value = {"scans": [{"id": 1, "name": "One"}]}
+            client.export_csv.side_effect = lambda scan_id, destination, **kwargs: write_csv(
+                destination, [["Name", "Risk"], ["Detection", "None"]],
+            )
+            args = build_parser().parse_args([
+                "report", "--scans", "1,1", "--output", directory,
+            ])
+            with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+                self.assertEqual(cmd_report(client, args, {}), 0)
+            root = next(Path(directory).iterdir())
+            self.assertFalse((root / "merged.xlsx").exists())
+
+    def test_all_failed_exports_do_not_create_merged_excel(self):
         with tempfile.TemporaryDirectory() as directory:
             client = Mock(url="https://scanner.example")
             client.list_folders.return_value = []
@@ -385,7 +655,74 @@ class ReportTests(unittest.TestCase):
             args = build_parser().parse_args(["report", "--all", "--merge", "--output", directory])
             with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
                 self.assertEqual(cmd_report(client, args, {}), 2)
-            self.assertFalse(list(Path(directory).rglob("*.csv")))
+            self.assertFalse(list(Path(directory).rglob("*.xlsx")))
+
+
+class OfflineMergeTests(unittest.TestCase):
+    def test_merge_folder_accepts_csv_and_xlsx_and_runs_without_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_header = [
+                "Plugin ID", "CVE", "Risk", "Host", "Protocol", "Port", "Name",
+                "Synopsis", "Description", "Solution", "See Also", "Plugin Output",
+            ]
+            common = [
+                "1", "High", "192.0.2.1", "tcp", "443",
+                "Google Chrome < 2 Multiple Vulnerabilities", "Summary", "Details",
+                "Upgrade", "https://example.test", "output",
+            ]
+            write_csv(root / "raw-scan.csv", [
+                csv_header,
+                [common[0], "CVE-1", *common[1:]],
+                [common[0], "CVE-2", *common[1:]],
+            ])
+            xlsx_header = [
+                "Source", "Group", "Name", "Risk", "Host", "Location", "Description",
+                "Solution", "Plugin Output", "See Also", "CVE", "Extra",
+            ]
+            write_xlsx(root / "existing.xlsx", [xlsx_header, [
+                "Original Source", "Existing Group", "Existing Finding", "Medium", "192.0.2.2",
+                "udp/53", "Already combined", "Fix", "evidence", "https://existing.test",
+                "CVE-3", "kept",
+            ]])
+            output = io.StringIO()
+            with patch("nctl.app._load_config") as load_config, \
+                    patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
+                self.assertEqual(main(["merge", str(root)]), 0)
+                load_config.assert_not_called()
+            merged = root / "merged.xlsx"
+            manifest_path = root / "merged.manifest.json"
+            self.assertTrue(merged.exists())
+            self.assertTrue(manifest_path.exists())
+            self.assertEqual(read_xlsx(merged), [
+                ["Source", "Group", "Name", "Risk", "Host", "Location", "Description",
+                 "Solution", "Plugin Output", "See Also", "CVE", "Extra", "Plugin ID"],
+                ["Original Source", "Existing Group", "Existing Finding", "Medium", "192.0.2.2",
+                 "udp/53", "Already combined", "Fix", "evidence", "https://existing.test",
+                 "CVE-3", "kept", ""],
+                ["raw-scan", "Security updates / Google Chrome",
+                 "Google Chrome < 2 Multiple Vulnerabilities", "High", "192.0.2.1", "tcp/443",
+                 "Summary\n\nDetails", "Upgrade", "output", "https://example.test",
+                 "CVE-1; CVE-2", "", "1"],
+            ])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["mode"], "offline_merge")
+            self.assertEqual(manifest["input_rows"], 3)
+            self.assertEqual(manifest["duplicates_removed"], 1)
+            self.assertIn("Merge offline 2 file", output.getvalue())
+
+            # The current output is excluded when the command is run again.
+            with patch("nctl.app._load_config") as load_config, \
+                    patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+                self.assertEqual(main(["merge", "--folder", str(root)]), 0)
+                load_config.assert_not_called()
+            self.assertEqual(len(read_xlsx(merged)), 3)
+
+    def test_merge_folder_requires_supported_input(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+            Path(directory, "notes.txt").write_text("nothing", encoding="utf-8")
+            self.assertEqual(main(["merge", directory]), 2)
 
 
 class ClientTests(unittest.TestCase):

@@ -18,7 +18,7 @@ from typing import Any, Sequence
 from . import __version__
 from .client import NctlClient, NctlError
 from .helptext import OVERVIEW, TOPICS
-from .report_groups import add_group_column
+from .report_excel import export_scan_xlsx, merge_scan_xlsx
 
 
 DEFAULT_URL = "https://127.0.0.1:11127"
@@ -428,32 +428,37 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
     if not selected:
         print("Không có scan trong phạm vi đã chọn.")
         return 0
+    auto_merge = len(selected) >= 2
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     report_dir = Path(args.output).expanduser() / f"nctl-report-{stamp}"
     report_dir.mkdir(parents=True, exist_ok=False)
     manifest: dict[str, Any] = {
         "created_at": datetime.now().astimezone().isoformat(),
         "server_url": client.url,
-        "format": "csv", "history_mode": "latest", "columns": "all",
+        "format": "xlsx", "history_mode": "latest", "columns": "all",
         "files": [], "errors": [],
     }
     manifest_path = report_dir / "manifest.json"
     _write_manifest(manifest_path, manifest)
     exported: list[Path] = []
+    raw_exports: list[Path] = []
     scan_names: list[str] = []
-    print(f"Xuất CSV đầy đủ cột cho {len(selected)} scan vào {report_dir}")
+    print(f"Xuất Excel đầy đủ cột cho {len(selected)} scan vào {report_dir}")
+    if auto_merge and not args.merge:
+        print("Tự động bật merge vì phạm vi thực tế có từ 2 scan trở lên.")
     for index, scan in enumerate(selected, 1):
         scan_id = int(scan["id"])
-        destination = report_dir / f"scan-{scan_id}_{_safe_name(scan.get('name') or 'scan')}.csv"
-        raw_destination = destination.with_suffix(destination.suffix + ".raw")
+        destination = report_dir / f"scan-{scan_id}_{_safe_name(scan.get('name') or 'scan')}.xlsx"
+        raw_destination = destination.with_suffix(".csv.raw")
         print(f"[{index}/{len(selected)}] Scan {scan_id}: {scan.get('name', '-')}")
         try:
             client.export_csv(
                 scan_id, raw_destination,
                 poll_interval=args.poll_interval, export_timeout=args.export_timeout,
             )
-            group_stats = add_group_column(raw_destination, destination)
+            group_stats = export_scan_xlsx(raw_destination, destination)
             exported.append(destination)
+            raw_exports.append(raw_destination)
             scan_name = str(scan.get("name") or f"scan-{scan_id}")
             scan_names.append(scan_name)
             manifest["files"].append({
@@ -462,24 +467,43 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
             })
             print(
                 f"  Group: {group_stats['rows']} dòng, {group_stats['groups']} nhóm; "
-                f"{group_stats['review_rows']} dòng cần xem lại."
+                f"{group_stats['review_rows']} dòng cần xem lại; "
+                f"{group_stats['truncated_cells']} ô vượt giới hạn Excel đã được rút gọn."
             )
+            for detail in group_stats["truncated_details"]:
+                print(
+                    f"  CẢNH BÁO {destination.name}: ô {detail['cell']} "
+                    f"({detail['column']}) dài {detail['original_length']} ký tự; "
+                    f"đã giữ {detail['saved_length']} ký tự và highlight ô."
+                )
         except (NctlError, OSError) as exc:
             manifest["errors"].append({"scan_id": scan_id, "error": str(exc)})
             print(f"LỖI scan {scan_id}: {exc}", file=sys.stderr)
-        finally:
-            raw_destination.unlink(missing_ok=True)
+        if raw_destination not in raw_exports:
+            try:
+                raw_destination.unlink(missing_ok=True)
+            except OSError as exc:
+                manifest["errors"].append({
+                    "scan_id": scan_id, "stage": "cleanup", "error": str(exc),
+                })
         _write_manifest(manifest_path, manifest)
-    if args.merge:
+    if args.merge or auto_merge:
         try:
-            merged = report_dir / "merged.csv"
+            merged = report_dir / "merged.xlsx"
             statistics: list[dict[str, Any]] = []
-            row_count = _merge_csv_files(exported, merged, scan_names, statistics=statistics)
+            merge_result = merge_scan_xlsx(
+                raw_exports, merged, scan_names, statistics=statistics,
+                file_names=[path.name for path in exported],
+            )
+            row_count = merge_result["rows"]
             input_rows = sum(item["input_rows"] for item in statistics)
             duplicates_removed = sum(item["duplicates_removed"] for item in statistics)
             manifest["merged"] = {
                 "file": merged.name, "rows": row_count, "scans": len(exported),
+                "automatic": auto_merge and not args.merge,
                 "input_rows": input_rows, "duplicates_removed": duplicates_removed,
+                "truncated_cells": merge_result["truncated_cells"],
+                "truncated_details": merge_result["truncated_details"],
                 "group_by": "all_columns_except_cve", "cve_separator": "; ",
                 "files": statistics,
             }
@@ -490,16 +514,103 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                     f"loại {item['duplicates_removed']} dòng trùng; giữ {item['unique_rows']} dòng unique."
                 )
             print(
-                f"Tổng gộp {len(exported)} CSV: đọc {input_rows} dòng dữ liệu; "
-                f"loại {duplicates_removed} dòng trùng; giữ {row_count} dòng unique vào {merged}"
+                f"Tổng gộp {len(exported)} report: đọc {input_rows} dòng dữ liệu; "
+                f"loại {duplicates_removed} dòng trùng; giữ {row_count} dòng unique vào {merged}; "
+                f"{merge_result['truncated_cells']} ô vượt giới hạn Excel đã được rút gọn."
             )
+            for detail in merge_result["truncated_details"]:
+                print(
+                    f"  CẢNH BÁO {merged.name}: ô {detail['cell']} "
+                    f"({detail['column']}) dài {detail['original_length']} ký tự; "
+                    f"đã giữ {detail['saved_length']} ký tự và highlight ô."
+                )
         except (NctlError, OSError) as exc:
             manifest["errors"].append({"stage": "merge", "error": str(exc)})
-            print(f"LỖI gộp CSV: {exc}", file=sys.stderr)
+            print(f"LỖI gộp Excel: {exc}", file=sys.stderr)
         _write_manifest(manifest_path, manifest)
+    for raw_destination in raw_exports:
+        try:
+            raw_destination.unlink(missing_ok=True)
+        except OSError as exc:
+            manifest["errors"].append({
+                "stage": "cleanup", "file": raw_destination.name, "error": str(exc),
+            })
+    _write_manifest(manifest_path, manifest)
     errors = len(manifest["errors"])
-    print(f"Hoàn tất: {len(exported)}/{len(selected)} CSV; {errors} lỗi. Chi tiết: {manifest_path}")
+    print(f"Hoàn tất: {len(exported)}/{len(selected)} Excel; {errors} lỗi. Chi tiết: {manifest_path}")
     return 2 if errors else 0
+
+
+def cmd_merge_files(
+    _: NctlClient | None, args: argparse.Namespace, __: dict[str, Any],
+) -> int:
+    if args.folder is not None and args.folder_option is not None:
+        raise NctlError("Chỉ truyền thư mục một lần: dạng positional hoặc --folder.")
+    folder_value = args.folder_option if args.folder_option is not None else args.folder
+    if folder_value is None:
+        raise NctlError("Cần truyền thư mục chứa file CSV/XLSX để merge.")
+    folder = Path(folder_value).expanduser().resolve()
+    if not folder.is_dir():
+        raise NctlError(f"Không tìm thấy thư mục đầu vào: {folder}")
+    destination = (
+        Path(args.output).expanduser().resolve()
+        if args.output is not None else folder / "merged.xlsx"
+    )
+    if not destination.suffix:
+        destination = destination.with_suffix(".xlsx")
+    elif destination.suffix.casefold() != ".xlsx":
+        raise NctlError("File output của lệnh merge phải có đuôi .xlsx.")
+    candidates = sorted(
+        (
+            path for path in folder.iterdir()
+            if path.is_file() and path.suffix.casefold() in {".csv", ".xlsx"}
+            and path.resolve() != destination
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    if not candidates:
+        raise NctlError(f"Thư mục {folder} không có file .csv hoặc .xlsx để merge.")
+    source_names = [path.stem for path in candidates]
+    statistics: list[dict[str, Any]] = []
+    print(f"Merge offline {len(candidates)} file từ {folder}")
+    for path in candidates:
+        print(f"  - {path.name}")
+    result = merge_scan_xlsx(
+        candidates, destination, source_names, statistics=statistics,
+        file_names=[path.name for path in candidates],
+    )
+    input_rows = sum(item["input_rows"] for item in statistics)
+    duplicates_removed = sum(item["duplicates_removed"] for item in statistics)
+    manifest_path = destination.with_suffix(".manifest.json")
+    manifest = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "mode": "offline_merge", "format": "xlsx",
+        "source_folder": str(folder), "output": str(destination),
+        "source_fallback": "input_file_stem",
+        "files": statistics,
+        "rows": result["rows"], "input_rows": input_rows,
+        "duplicates_removed": duplicates_removed,
+        "truncated_cells": result["truncated_cells"],
+        "truncated_details": result["truncated_details"],
+        "group_by": "all_columns_except_cve", "cve_separator": "; ",
+    }
+    _write_manifest(manifest_path, manifest)
+    for item in statistics:
+        print(
+            f"  Unique {item['file']}: đọc {item['input_rows']} dòng dữ liệu; "
+            f"loại {item['duplicates_removed']} dòng trùng; giữ {item['unique_rows']} dòng unique."
+        )
+    for detail in result["truncated_details"]:
+        print(
+            f"  CẢNH BÁO {destination.name}: ô {detail['cell']} "
+            f"({detail['column']}) dài {detail['original_length']} ký tự; "
+            f"đã giữ {detail['saved_length']} ký tự và highlight ô."
+        )
+    print(
+        f"Hoàn tất: đọc {input_rows} dòng; loại {duplicates_removed} dòng trùng; "
+        f"ghi {result['rows']} dòng vào {destination}. Manifest: {manifest_path}"
+    )
+    return 0
 
 
 def _backup_folder_layout(
@@ -1385,7 +1496,7 @@ class NctlArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = NctlArgumentParser(
         prog="nctl",
-        description="Backup, restore, xuất report CSV, tạo và theo dõi scan trên máy chủ quét.",
+        description="Backup, restore, xuất report Excel, tạo và theo dõi scan trên máy chủ quét.",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--config", type=Path, default=Path("config.json"), help="JSON config (mặc định: config.json)")
@@ -1401,7 +1512,7 @@ def build_parser() -> argparse.ArgumentParser:
     help_command = sub.add_parser("help", help="Hướng dẫn offline kèm ví dụ sử dụng")
     help_command.add_argument(
         "topic", nargs="*", metavar="TOPIC",
-        help="setup, status, folders, scans, backup, report, restore, delete, task [create|launch], monitor",
+        help="setup, status, folders, scans, backup, report, merge, restore, delete, task [create|launch], monitor",
     )
     help_command.epilog = "Ví dụ: nctl help; nctl help setup; nctl help task create"
 
@@ -1433,7 +1544,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--export-timeout", type=float, default=1800, help="Timeout mỗi export")
     backup.set_defaults(handler=cmd_backup)
 
-    report = sub.add_parser("report", help="Xuất report CSV đầy đủ cột, mỗi scan một file")
+    report = sub.add_parser("report", help="Xuất report Excel đầy đủ cột, mỗi scan một file")
     report_selector = report.add_mutually_exclusive_group(required=True)
     report_selector.add_argument("--scan", type=int, help="Một scan ID")
     report_selector.add_argument("--scans", help="Danh sách scan ID, phân cách bằng dấu phẩy")
@@ -1442,10 +1553,19 @@ def build_parser() -> argparse.ArgumentParser:
     report_selector.add_argument("--all", action="store_true", help="Toàn bộ scan (mặc định bỏ qua Trash)")
     report.add_argument("--include-trash", action="store_true", help="Bao gồm Trash khi dùng --all")
     report.add_argument("--output", default="reports", help="Thư mục chứa lượt report (mặc định: reports)")
-    report.add_argument("--merge", action="store_true", help="Gộp thêm merged.csv với cột Source là tên scan, chỉ giữ một header")
+    report.add_argument(
+        "--merge", action="store_true",
+        help="Gộp thêm merged.xlsx khi chỉ chọn 1 scan; từ 2 scan trở lên tự động merge",
+    )
     report.add_argument("--poll-interval", type=float, default=1.0, help="Chu kỳ kiểm tra export (giây)")
     report.add_argument("--export-timeout", type=float, default=1800, help="Timeout mỗi export (giây)")
     report.set_defaults(handler=cmd_report)
+
+    merge = sub.add_parser("merge", help="Merge offline các file CSV/XLSX trong một thư mục")
+    merge.add_argument("folder", nargs="?", type=Path, help="Thư mục chứa file CSV/XLSX")
+    merge.add_argument("--folder", dest="folder_option", type=Path, help="Thư mục chứa file CSV/XLSX")
+    merge.add_argument("--output", type=Path, help="File Excel đầu ra (mặc định: <folder>/merged.xlsx)")
+    merge.set_defaults(handler=cmd_merge_files, offline=True)
 
     restore = sub.add_parser("restore", help="Restore hàng loạt file .db")
     restore.add_argument("paths", nargs="+", help="File .db hoặc thư mục (tìm đệ quy)")
@@ -1539,6 +1659,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     client: NctlClient | None = None
     try:
+        if getattr(args, "offline", False):
+            return int(args.handler(None, args, {}))
         config = _load_config(args.config)
         client = _make_client(args, config)
         return int(args.handler(client, args, config))

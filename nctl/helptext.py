@@ -1,6 +1,6 @@
 """Offline user guide shipped with the CLI and portable executable."""
 
-OVERVIEW = """nctl - quản lý scan, report CSV và backup/restore DB
+OVERVIEW = """nctl - quản lý scan, report Excel và backup/restore DB
 
 Bắt đầu:
   1. Đặt EXE và config.json trong cùng thư mục; mở terminal tại thư mục đó.
@@ -14,6 +14,7 @@ Ví dụ nhanh:
   .\\nctl.exe help restore
   .\\nctl.exe backup --all
   .\\nctl.exe report --all --merge
+  .\\nctl.exe merge .\\existing-reports
   .\\nctl.exe restore .\\backup
 
 Tùy chọn kết nối phải đứng TRƯỚC subcommand:
@@ -103,8 +104,8 @@ Lỗi một history không dừng phần còn lại; exit code khác 0 nếu có
   .\\nctl.exe report --all --merge --output D:\\ScanReports
   .\\nctl.exe report --all --include-trash
 
-Mỗi scan xuất kết quả mới nhất thành một file CSV riêng, bật toàn bộ cột API hỗ trợ.
-Mỗi CSV tự thêm cột Group, kể cả khi không dùng --merge; file gộp cũng giữ Group.
+Mỗi scan xuất kết quả mới nhất thành một file Excel riêng, bật toàn bộ cột API hỗ trợ.
+File riêng giữ nguyên thứ tự cột gốc và thêm Group ở cuối; file gộp cũng có Group.
 Group không chứa host hay tên scan: lọc Group trên mọi host, rồi lọc Host/Source nếu cần.
 Tên nhóm phần mềm bắt đầu bằng "Security updates /", ví dụ Ubuntu / Linux kernel,
 Microsoft .NET Framework, Google Chrome, Apache Log4j, Fortinet FortiGate.
@@ -118,24 +119,48 @@ Folder nhận ID hoặc tên, không phân biệt hoa thường; tên có dấu 
 --all bỏ qua Trash mặc định; --include-trash để lấy cả Trash.
 Chọn rõ scan ID hoặc folder Trash vẫn xuất các scan đó.
 Output mặc định: reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
-Tên file: scan-12_Ten scan.csv; manifest.json ghi các file và lỗi.
---merge tạo thêm merged.csv từ toàn bộ CSV thành công của lượt chạy, giữ nguyên file lẻ.
+Tên file: scan-12_Ten scan.xlsx; manifest.json ghi các file và lỗi.
+Từ 2 scan thực tế trở lên tự tạo merged.xlsx, bất kể đầu vào là list, folder, nhiều folder hay --all.
+Với đúng 1 scan, dùng --merge nếu vẫn muốn tạo file gộp. Các file lẻ luôn được giữ nguyên.
 File gộp chỉ có một header ở dòng đầu; dữ liệu tất cả scan nối tiếp phía sau.
-Trong từng CSV, gộp các dòng giống ở mọi cột ngoài CVE, giữ thứ tự xuất hiện đầu tiên.
+Thứ tự đầu file gộp: Source, Group, Name, Risk, Host, Location, Description, Solution,
+Plugin Output, See Also, CVE, sau đó là các cột còn lại.
+Chỉ file gộp tạo Location từ Protocol/Port và Description từ Synopsis + dòng trống + Description gốc.
+File gộp nối các xuống dòng đơn do wrap web trong Synopsis, Description và Solution;
+vẫn giữ đoạn trống, bullet, danh sách đánh số, URL và khối thụt dòng. Plugin Output không bị reflow.
+Tất cả cell căn trên và tắt Wrap Text, kể cả nội dung có nhiều dòng.
+Header in đậm, freeze ở hàng đầu và bật sẵn Filter.
+Ô vượt 32.767 ký tự được rút gọn, highlight, log địa chỉ ô và ghi chi tiết vào manifest.json.
+Trong từng scan, gộp các dòng giống ở mọi cột ngoài CVE, giữ thứ tự xuất hiện đầu tiên.
 Gom CVE khác nhau vào một ô, phân cách bằng "; ", bỏ CVE lặp và giữ đủ thông tin.
 Dòng khác severity/score/plugin output hoặc bất kỳ cột nào ngoài CVE vẫn giữ riêng.
-Dòng giống nhau ở các CSV của scan khác nhau vẫn được giữ theo Source tương ứng.
-In số dòng đã đọc, dòng trùng/gộp bị loại và dòng unique giữ lại cho từng CSV và tổng.
+Dòng giống nhau ở các scan khác nhau vẫn được giữ theo Source tương ứng.
+In số dòng đã đọc, dòng trùng/gộp bị loại và dòng unique giữ lại cho từng scan và tổng.
 Các số đếm này cũng được lưu trong manifest.json; không tính header hoặc dòng trống.
-Chỉ lọc trùng khi --merge; các CSV lẻ vẫn giữ nguyên dữ liệu gốc.
+Chỉ lọc trùng khi --merge; các file Excel lẻ vẫn giữ nguyên dữ liệu gốc.
 Cột Source ở đầu file gộp ghi tên scan gốc cho từng dòng, giúp lọc khi IP trùng.
 Tên scan giữ nguyên, không lấy tên file đã thay ký tự; scan thiếu tên dùng scan-ID.
 Giữ nguyên dấu phẩy, dấu ngoặc kép, Unicode và nội dung xuống dòng trong ô.
-Nếu các CSV có cột khác nhau, lấy hợp tất cả cột, ánh xạ theo tên và để trống ô thiếu.
-File gộp dùng UTF-8 BOM để mở Unicode trong Excel.
+Nếu các scan có cột khác nhau, lấy hợp tất cả cột, ánh xạ theo tên và để trống ô thiếu.
 Lỗi một scan không dừng scan còn lại; exit code 2 nếu có lỗi export/gộp.
-Nếu scan nào thất bại, merged.csv chỉ chứa các scan xuất thành công; xem manifest.json.
+Nếu scan nào thất bại, merged.xlsx chỉ chứa các scan xuất thành công; xem manifest.json.
 Scan chưa có kết quả hoặc không có quyền export có thể báo lỗi từ máy chủ.
+""",
+    "merge": """Ví dụ:
+  .\\nctl.exe merge .\\existing-reports
+  .\\nctl.exe merge --folder D:\\ScanReports
+  .\\nctl.exe merge .\\existing-reports --output D:\\Combined\\report.xlsx
+
+Lệnh chạy offline, không cần config hoặc đăng nhập máy chủ.
+Đọc trực tiếp các file .csv và .xlsx ở cấp đầu tiên của thư mục; dùng worksheet đầu tiên của XLSX.
+File output hiện tại được bỏ qua nếu nằm trong thư mục đầu vào.
+Nếu một dòng đã có Source hoặc Group thì giữ giá trị đó; ô trống hoặc cột thiếu sẽ được tự bổ sung.
+Source thiếu dùng tên file không có phần mở rộng. Group thiếu được phân loại theo cùng quy tắc report.
+Nếu file đã có Location/Description tổng hợp thì giữ nguyên; nếu còn Protocol/Port hoặc Synopsis/Description
+thì tạo Location và Description theo cùng quy tắc merged.xlsx của report.
+Đầu ra mặc định là <folder>/merged.xlsx và <folder>/merged.manifest.json.
+File gộp áp dụng unique/CVE, thứ tự cột, highlight ô bị rút gọn, header, freeze và Filter như report.
+Synopsis, Description và Solution cũng được bỏ xuống dòng do wrap web; Plugin Output giữ nguyên.
 """,
     "restore": """Ví dụ:
   .\\nctl.exe restore .\\task1.db
