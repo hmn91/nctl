@@ -1,112 +1,231 @@
 # nctl
 
-Công cụ dòng lệnh quản lý máy chủ quét: list scan/history, report Excel, backup/restore `.db`, tạo task và monitor.
+`nctl` là CLI quản lý máy chủ quét: xem folder/scan, xuất report Excel, backup và restore database,
+tạo hoặc chạy task, theo dõi tiến độ và xóa scan. Bản Windows portable chạy độc lập; mã nguồn yêu cầu
+Python 3.10 trở lên.
 
-## Bắt đầu
+Phiên bản hiện tại: **2.6.1**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+## Bắt đầu nhanh
+
+### Windows portable
+
+Giải nén gói phát hành, mở PowerShell tại thư mục đó rồi tạo cấu hình:
 
 ```powershell
-if (-not (Test-Path config.json)) { Copy-Item config.example.json config.json }
+Copy-Item config.example.json config.json
 # Sửa url, username và password trong config.json
 .\nctl.exe status
 .\nctl.exe help
 ```
 
-Mọi hướng dẫn, ví dụ và lưu ý an toàn được tích hợp trong chương trình:
+### Chạy từ mã nguồn
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+python nctl.py status
+```
+
+Không đưa `config.json`, file credential thật, database backup hoặc report có dữ liệu nhạy cảm lên Git.
+
+## Cấu hình
+
+Thứ tự ưu tiên là tham số CLI, biến môi trường, `config.json`, sau đó mới đến giá trị mặc định.
+Các biến thường dùng:
+
+```powershell
+$env:NCTL_USERNAME = "admin"
+$env:NCTL_PASSWORD = "your-login-password"
+$env:NCTL_DB_PASSWORD = "your-db-password"
+$env:NCTL_ACCESS_KEY = "your-access-key"
+$env:NCTL_SECRET_KEY = "your-secret-key"
+$env:NCTL_TIMEOUT = "60"
+```
+
+Mặc định chương trình dùng `https://127.0.0.1:11127` và không kiểm tra TLS để hỗ trợ chứng chỉ tự ký.
+Dùng `--verify-tls` khi máy đã tin cậy CA. Có thể dùng access key/secret key thay cho username/password.
+
+## Lệnh chính
+
+| Lệnh | Mục đích |
+| --- | --- |
+| `status` | Kiểm tra kết nối và phiên bản máy chủ |
+| `folders` | Liệt kê folder |
+| `scans` | Liệt kê scan, có thể lọc theo folder |
+| `report` | Xuất report Excel từ một hoặc nhiều scan/folder |
+| `merge` | Gộp các file CSV/XLSX có sẵn và tạo report chuẩn hóa |
+| `backup` | Tải database `.db` theo scan/history |
+| `restore` | Import lại database, có checkpoint để resume |
+| `delete` | Chuyển scan vào Trash hoặc xóa vĩnh viễn |
+| `task create` | Tạo scan từ danh sách target và credential tùy chọn |
+| `task launch` | Chạy scan đã tồn tại |
+| `monitor` | Theo dõi trạng thái và tiến độ scan |
+
+Hướng dẫn đầy đủ luôn có trong chương trình:
 
 ```powershell
 .\nctl.exe --help
-.\nctl.exe help setup
-.\nctl.exe help backup
 .\nctl.exe help report
+.\nctl.exe help merge
+.\nctl.exe help backup
 .\nctl.exe help restore
 .\nctl.exe help delete
-.\nctl.exe help task
+.\nctl.exe help task create
 .\nctl.exe help monitor
 ```
 
-Bản Windows portable không cần Python. Khi chạy mã nguồn: `python nctl.py help` hoặc `python -m nctl help`.
+## Thư mục dữ liệu mặc định
+
+Chương trình tách dữ liệu runtime dưới `data/`:
+
+- Report: `data/reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/`
+- Backup: `data/backups/nctl-backup-YYYYMMDD-HHMMSS/`
+
+Thư mục `data/`, `config.json`, `.venv/`, `build/`, `dist/` và `release/` không được commit.
 
 ## Report Excel
 
-Xuất report Excel đầy đủ cột, mỗi scan một file riêng (kết quả mới nhất):
+### Chọn dữ liệu
 
 ```powershell
 .\nctl.exe report --scan 12
 .\nctl.exe report --scans "12,15,20"
 .\nctl.exe report --folder "Target Group 1"
-.\nctl.exe report --folders "Target Group 1" "Target Group 2" --merge
-.\nctl.exe report --all --merge
+.\nctl.exe report --folders "Target Group 1" "Target Group 2"
+.\nctl.exe report --all
+.\nctl.exe report --all --include-trash
 ```
 
-Output mặc định trong `reports/nctl-report-.../`. Từ 2 scan thực tế trở lên chương trình tự tạo
-`merged.xlsx` rồi `merged_resolved.xlsx`, bất kể chọn bằng list scan, folder, nhiều folder hay `--all`. Với đúng 1 scan,
-dùng `--merge` nếu vẫn muốn tạo file gộp;
-các file Excel riêng vẫn được giữ. Mỗi file riêng giữ nguyên thứ tự cột gốc và thêm `Group` ở cuối.
-File gộp đặt các cột đầu theo thứ tự `Source`, `Group`, `Name`, `Risk`, `Host`, `Location`,
-`Description`, `Solution`, `Plugin Output`, `See Also`, `CVE`, rồi đến các cột còn lại.
-Chỉ trong file gộp, `Location` ghép `Protocol/Port`; `Description` ghép `Synopsis`, một dòng trống,
-rồi `Description` gốc. Tất cả ô được căn trên và tắt Wrap Text.
-Trong file merge, các xuống dòng đơn dùng để wrap nội dung web được nối lại trong `Synopsis`,
-`Description` và `Solution`; đoạn trống, bullet, danh sách, URL và khối thụt dòng được giữ nguyên.
-Hàng header được in đậm, freeze ở trên cùng và bật sẵn Filter. Ô vượt giới hạn 32.767 ký tự
-của Excel được rút gọn, highlight, in cảnh báo ra terminal và ghi chi tiết vào `manifest.json`.
-Group chỉ mô tả nguyên nhân/thành phần (ví dụ `Security updates / Ubuntu / Linux kernel`
-hoặc `Security updates / Microsoft .NET Framework`), không chứa host hay tên scan.
-Tên group ưu tiên tên plugin; trường hợp tên chưa rõ cần bằng chứng phiên bản trong
-`Plugin Output` và sản phẩm được nêu trong `Solution`, không dùng danh sách package cố định.
-Lọc thêm `Host` hoặc `Source` để thu hẹp phạm vi. Trường hợp chưa rõ được ghi
-`Cần xem lại / Plugin <ID>`; dữ liệu gốc và thứ tự dòng được giữ nguyên.
-Cột `Source` ở đầu file gộp chứa tên scan sinh ra từng dòng, giúp lọc các IP trùng giữa scan.
-Khi gộp, các dòng giống ở mọi cột ngoài `CVE` trong từng scan được gom thành một dòng,
-theo thứ tự ban đầu; ô `CVE` chứa toàn bộ CVE khác nhau, phân cách bằng `; `.
-Dòng khác ở bất kỳ cột nào ngoài `CVE` vẫn giữ riêng.
-Dòng giống nhau từ các scan khác nhau vẫn được giữ với `Source` tương ứng.
-Log và `manifest.json` ghi số dòng đọc, dòng trùng bị loại và dòng unique giữ lại cho từng scan và tổng.
-Chỉ `merged.xlsx` được lọc trùng khi dùng `--merge`; các file riêng giữ nguyên dữ liệu gốc.
-Sau khi tạo xong `merged.xlsx`, chương trình tạo thêm `merged_resolved.xlsx`. File thứ hai có cột
-`References` ngay sau `See Also`. Mỗi URL rút gọn `nessus.org/u?...` được chuẩn hóa và chỉ resolve một lần;
-URL đích chỉ được giữ nếu trả về HTTP 2xx và không redirect thêm lần nữa. URL hết hạn, lỗi kết nối hoặc còn
-redirect bị bỏ qua. Mỗi reference nằm trên một dòng trong cell. Kết quả và lý do bỏ URL được ghi trong manifest.
-`--all` bỏ qua Trash; thêm `--include-trash` để lấy cả Trash. Lỗi và thống kê nhóm được ghi vào `manifest.json`
-và trả exit code 2. Chi tiết: `nctl help report`.
+`--scan` và `--scans` nhận scan ID. `--folder` và `--folders` nhận folder ID hoặc tên, không phân biệt
+hoa thường. Scan/folder trùng chỉ được xử lý một lần. `--all` bỏ qua Trash trừ khi có `--include-trash`.
 
-Merge các report CSV/XLSX đã có mà không cần kết nối máy chủ:
+Từ hai scan thực tế trở lên, chương trình tự động merge bất kể kiểu selector. Với đúng một scan, thêm
+`--merge` nếu vẫn muốn tạo file gộp.
+
+### File đầu ra
+
+| File | Nội dung |
+| --- | --- |
+| `scan-<id>_<name>.xlsx` | Một file cho mỗi scan; giữ cột gốc và thêm `Group` ở cuối |
+| `merged.xlsx` | Dữ liệu chuẩn hóa và gộp từ các scan thành công |
+| `merged_resolved.xlsx` | Bản gộp có thêm cột `References` sau `See Also` |
+| `merged_resolved_lookup.xlsx` | Chi tiết URL nguồn, URL đích, status, số lần thử và lý do giữ/bỏ |
+| `manifest.json` | Metadata, lỗi, thống kê dòng, group, URL và cell bị rút gọn |
+
+Một scan export lỗi không dừng các scan còn lại. Khi có lỗi, exit code là 2 và `merged.xlsx` chỉ chứa
+những scan xuất thành công.
+
+### Chuẩn hóa file gộp
+
+Các cột đầu được sắp theo thứ tự:
+
+`Source`, `Group`, `Name`, `Risk`, `Host`, `Location`, `Description`, `Solution`, `Plugin Output`,
+`See Also`, `CVE`, sau đó đến các cột còn lại.
+
+- `Source` là tên scan sinh ra dòng dữ liệu, giúp phân biệt IP trùng giữa nhiều scan.
+- `Location` ghép `Protocol/Port` theo dạng `<protocol>/<port>`.
+- `Description` ghép `Synopsis`, hai ký tự xuống dòng, rồi `Description` gốc.
+- Xuống dòng mềm do giao diện web trong `Synopsis`, `Description` và `Solution` được nối lại; paragraph,
+  bullet, danh sách, URL và khối thụt dòng vẫn được giữ.
+- Các dòng giống ở mọi cột ngoài `CVE` được gom trong phạm vi từng scan; CVE khác nhau được nối bằng `; `.
+- Dòng từ scan khác nhau vẫn tách riêng nhờ `Source`.
+- Header in đậm, freeze top row và bật Filter; mọi cell căn trên và tắt Wrap Text.
+- Cell vượt 32.767 ký tự được rút gọn, highlight, log ra terminal và ghi vị trí vào manifest.
+
+### Phân nhóm lỗ hổng
+
+`Group` mô tả nguyên nhân hoặc thành phần, không chứa host hay tên scan. Ví dụ:
+
+- `Security updates / Ubuntu / Linux kernel`
+- `Security updates / Microsoft .NET Framework`
+- `Security updates / Google Chrome`
+- `Configuration / TLS`
+- `Information / Service detection`
+
+Tên group ưu tiên tên plugin. Khi tên chưa rõ, logic dùng thêm sản phẩm trong `Solution` và bằng chứng
+phiên bản trong `Plugin Output`; không giới hạn vào danh sách package cố định. Trường hợp chưa đủ bằng chứng
+được ghi `Cần xem lại / Plugin <ID>`.
+
+### Resolve References
+
+Sau khi tạo `merged.xlsx`, chương trình resolve **mọi URL HTTP/HTTPS** trong `See Also`, kể cả dòng có
+`Risk = None`:
+
+1. URL rút gọn dạng `nessus.org/u?...` được chuẩn hóa qua endpoint Tenable.
+2. URL trực tiếp được kiểm tra ngay; mỗi URL nguồn chuẩn hóa chỉ resolve một lần.
+3. Tối đa 16 worker chạy liên tục; progress được in sau mỗi 25 URL hoàn thành.
+4. Theo tối đa 20 redirect, dừng nếu phát hiện loop.
+5. Redirect từ trang con về homepage chỉ bị bỏ khi hostname giống nhau, không tính tiền tố `www`.
+   Chuyển sang subdomain khác vẫn tiếp tục được kiểm tra.
+6. URL đích trùng nhau chỉ xuất hiện một lần trong mỗi cell `References`, kể cả khi URL đã tồn tại sẵn.
+
+| Kết quả | Xử lý |
+| --- | --- |
+| HTTP 2xx | Giữ trong `References`, status `resolved` |
+| HTTP 401/403 | Retry; nếu vẫn bị chặn thì giữ, status `access_restricted` |
+| HTTP 404/410, lỗi HTTP khác hoặc lỗi kết nối sau retry | Bỏ |
+| Redirect loop hoặc quá 20 redirect | Bỏ, không retry |
+| Trang con quay về homepage cùng hostname | Bỏ, không retry |
+
+Các lỗi `access_restricted`, `shortener_not_redirect`, `missing_location`, `target_unavailable` và
+`request_error` được retry tối đa ba lần sau lần đầu, chờ lần lượt 1, 2 và 4 giây.
+
+## Merge report có sẵn
 
 ```powershell
 .\nctl.exe merge .\existing-reports
-.\nctl.exe merge --folder D:\ScanReports --output D:\Combined\report.xlsx
+.\nctl.exe merge --folder D:\ScanReports
+.\nctl.exe merge .\existing-reports --output D:\Combined\report.xlsx
 ```
 
-Lệnh đọc các file `.csv` và `.xlsx` ở cấp đầu tiên của thư mục. Nếu đã có `Source`, `Group`,
-`Location` hoặc `Description` tổng hợp thì giữ lại; cột thiếu được bổ sung theo cùng logic của
-`report --merge`. Khi thiếu `Source`, tên file được dùng làm nguồn. Output mặc định gồm `merged.xlsx`,
-`merged_resolved.xlsx` và `merged.manifest.json` trong thư mục đầu vào. Bước đọc/gộp file chạy offline;
-bước tạo file resolved cần kết nối Internet để kiểm tra URL đích.
+Lệnh đọc file `.csv` và `.xlsx` ở cấp đầu tiên của thư mục, dùng worksheet đầu tiên của XLSX. File output
+hiện tại được loại khỏi input khi chạy lại. Cột `Source`, `Group`, `Location` và `Description` có sẵn được giữ;
+ô hoặc cột thiếu được bổ sung theo cùng logic của `report --merge`. Nếu thiếu `Source`, tên file được dùng.
 
-## Phát triển
+Bước đọc và gộp file không cần kết nối máy chủ; bước tạo file resolved cần Internet để kiểm tra URL.
+
+## Backup và restore
 
 ```powershell
-python -m pip install -e .
-python -m unittest discover -s tests -v
-pyinstaller --noconfirm nctl.spec
+.\nctl.exe backup --scan 12
+.\nctl.exe backup --folder "Target Group 1"
+.\nctl.exe backup --all
+.\nctl.exe restore .\data\backups\nctl-backup-...
 ```
 
-Không chia sẻ `config.json` hay file credential đã cấu hình vì có thể chứa bí mật.
+Backup mặc định lấy mọi history và giữ cấu trúc folder. Restore dùng `.nctl-restore.json` làm checkpoint:
+chạy lại cùng lệnh sẽ bỏ qua file đã import thành công vào cùng máy chủ, tài khoản và folder. Upload tự retry
+tối đa ba lần khi gặp lỗi kết nối, timeout hoặc TLS EOF, chờ 2/4/8 giây. `--force` import lại và có thể tạo
+scan trùng.
 
-Restore tự retry upload tối đa 3 lần khi lỗi kết nối/timeout/TLS EOF (chờ 2/4/8 giây),
-không tự retry bước import. Resume mặc định lưu `.nctl-restore.json` cạnh file `.db`:
-chạy lại cùng lệnh sẽ bỏ qua file đã import thành công vào cùng máy chủ/tài khoản/folder.
-Dùng `restore ... --force` để import lại (có thể tạo scan trùng). Giữ checkpoint khi
-chuyển backup; không chạy nhiều restore đồng thời trên cùng thư mục. Nếu mất phản hồi
-import, kiểm tra scan trên server trước khi chạy lại. Chi tiết: `nctl help restore`.
+## Task, monitor và delete
 
-## Cấu trúc project
+```powershell
+.\nctl.exe task create --targets targets.txt --name "Weekly servers"
+.\nctl.exe task launch 42
+.\nctl.exe monitor 42 --interval 5
+.\nctl.exe delete --scan 42
+```
 
-- `nctl/`: mã nguồn CLI, API client và help tích hợp.
-- `nctl.py`: entry point khi chạy Python hoặc đóng gói EXE.
-- `nctl.spec`: cấu hình build EXE; `pyproject.toml`: package và lệnh `nctl`.
-- `tests/`: kiểm thử; các file `*.example.*`: cấu hình mẫu.
-- `dist/nctl.exe`, `release/`: EXE và bản portable mới nhất.
-- `config.json`, `backups/`, `.venv/`: cấu hình/dữ liệu/môi trường local, không đưa vào Git.
+`delete` mặc định chỉ chuyển scan vào Trash. `--permanent` xóa vĩnh viễn và yêu cầu nhập lại mật khẩu đăng
+nhập. Nên backup trước khi xóa vĩnh viễn. Credential cho task có thể lấy từ biến môi trường và file
+`credentials.example.jsonc`; không lưu secret thật trong repository.
 
-`build/`, cache Python và metadata `*.egg-info/` được tự tạo lại khi test/build/install.
+## Phát triển và build
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean nctl.spec
+.\dist\nctl.exe --version
+```
+
+Dependencies runtime được khai báo trong `pyproject.toml` và `requirements.txt`: `requests` và
+`XlsxWriter`. Cấu trúc chính:
+
+- `nctl/`: CLI, API client, xử lý report và help tích hợp.
+- `tests/`: unit/integration tests không yêu cầu máy chủ thật.
+- `nctl.py`: entry point khi chạy mã nguồn.
+- `nctl.spec`: cấu hình PyInstaller.
+- `config.example.json`, `credentials.example.jsonc`, `targets.example.txt`: file mẫu an toàn.

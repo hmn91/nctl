@@ -32,6 +32,12 @@ from nctl.helptext import TOPICS
 
 
 class AppTests(unittest.TestCase):
+    def test_default_outputs_are_partitioned_under_data(self):
+        backup = build_parser().parse_args(["backup", "--scan", "1"])
+        report = build_parser().parse_args(["report", "--scan", "1"])
+        self.assertEqual(Path(backup.output), Path("data") / "backups")
+        self.assertEqual(Path(report.output), Path("data") / "reports")
+
     def test_backup_folder_layout_preserves_names_and_resolves_collisions(self):
         layout, manifest = _backup_folder_layout(
             [

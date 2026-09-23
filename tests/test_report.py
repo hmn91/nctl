@@ -14,6 +14,7 @@ import xlsxwriter
 from nctl.app import _merge_csv_files, _report_scans, build_parser, cmd_report, main
 from nctl.client import CSV_COLUMNS, NctlClient, NctlError
 from nctl.report_excel import (
+    _extract_reference_urls,
     export_scan_xlsx,
     merge_scan_xlsx,
     reflow_narrative,
@@ -240,7 +241,51 @@ class GroupTests(unittest.TestCase):
 
 
 class ExcelReportTests(unittest.TestCase):
-    def test_resolve_nessus_reference_accepts_one_redirect_only(self):
+    def test_extract_reference_urls_keeps_balanced_url_parentheses(self):
+        self.assertEqual(_extract_reference_urls(
+            "See (https://wiki.example/Manual:Ciphers(1)). Also https://vendor.example/a]. "
+            "Ignore https://[broken"
+        ), [
+            "https://wiki.example/Manual:Ciphers(1)",
+            "https://vendor.example/a",
+        ])
+
+    def test_resolve_direct_urls_without_requiring_a_redirect(self):
+        class Response:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        direct_url = "https://vendor.example/advisory"
+        session = Mock()
+        session.get.return_value = Response(200)
+        with patch("nctl.report_excel._http_session", return_value=session):
+            resolved = resolve_nessus_reference(direct_url, retries=0)
+        self.assertEqual(resolved, {
+            "source_url": direct_url,
+            "target_url": direct_url,
+            "status": "resolved",
+            "http_status": 200,
+            "redirect_count": 0,
+            "redirect_chain": [direct_url],
+            "attempts": 1,
+            "attempt_statuses": ["resolved"],
+        })
+
+        session.get.return_value = Response(403)
+        with patch("nctl.report_excel._http_session", return_value=session):
+            restricted = resolve_nessus_reference(direct_url, retries=0)
+        self.assertEqual(restricted["status"], "access_restricted")
+        self.assertEqual(restricted["target_url"], direct_url)
+        self.assertEqual(restricted["redirect_count"], 0)
+
+    def test_resolve_nessus_reference_accepts_up_to_twenty_redirects(self):
         class Response:
             def __init__(self, status_code, location=None):
                 self.status_code = status_code
@@ -254,47 +299,223 @@ class ExcelReportTests(unittest.TestCase):
 
         session = Mock()
         session.get.side_effect = [
-            Response(301, "https://vendor.example/advisory"),
+            *[
+                Response(301, f"https://vendor.example/step-{index}")
+                for index in range(1, 21)
+            ],
             Response(200),
         ]
         with patch("nctl.report_excel._http_session", return_value=session):
-            result = resolve_nessus_reference("http://www.nessus.org/u?abc123")
+            result = resolve_nessus_reference(
+                "http://www.nessus.org/u?abc123", sleeper=Mock(),
+            )
         self.assertEqual(result, {
             "source_url": "http://www.nessus.org/u?abc123",
-            "target_url": "https://vendor.example/advisory",
+            "target_url": "https://vendor.example/step-20",
             "status": "resolved",
+            "http_status": 200,
+            "redirect_count": 20,
+            "redirect_chain": [
+                "https://api.tenable.com/v1/u?abc123",
+                *[
+                    f"https://vendor.example/step-{index}"
+                    for index in range(1, 21)
+                ],
+            ],
+            "attempts": 1,
+            "attempt_statuses": ["resolved"],
         })
         self.assertEqual(session.get.call_args_list[0].args[0],
                          "https://api.tenable.com/v1/u?abc123")
         self.assertFalse(session.get.call_args_list[0].kwargs["allow_redirects"])
-        self.assertFalse(session.get.call_args_list[1].kwargs["allow_redirects"])
+        self.assertEqual(len(session.get.call_args_list), 21)
+        self.assertTrue(all(
+            not call.kwargs["allow_redirects"] for call in session.get.call_args_list
+        ))
 
-        session.get.reset_mock()
+    def test_homepage_redirect_and_too_many_redirects_do_not_retry(self):
+        class Response:
+            def __init__(self, status_code, location=None):
+                self.status_code = status_code
+                self.headers = {} if location is None else {"Location": location}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        session = Mock()
         session.get.side_effect = [
-            Response(301, "https://vendor.example/old"),
-            Response(302, "https://vendor.example/new"),
+            response
+            for _ in range(4)
+            for response in (
+                Response(301, "https://www.vendor.example/advisory/123"),
+                Response(302, "https://vendor.example/"),
+            )
+        ]
+        sleeper = Mock()
+        with patch("nctl.report_excel._http_session", return_value=session):
+            rejected = resolve_nessus_reference(
+                "https://nessus.org/u?homepage", sleeper=sleeper,
+            )
+        self.assertEqual(rejected["status"], "redirected_to_homepage")
+        self.assertEqual(rejected["attempts"], 1)
+        self.assertEqual(rejected["redirect_count"], 2)
+        self.assertEqual(rejected["attempt_statuses"], ["redirected_to_homepage"])
+        sleeper.assert_not_called()
+
+        session.reset_mock()
+        session.get.side_effect = [
+            Response(301, "https://www.microsoft.com/net"),
+            Response(302, "https://dotnet.microsoft.com/"),
+            Response(200),
         ]
         with patch("nctl.report_excel._http_session", return_value=session):
-            rejected = resolve_nessus_reference("https://nessus.org/u?second")
-        self.assertEqual(rejected["status"], "target_redirects_again")
+            cross_subdomain = resolve_nessus_reference(
+                "https://nessus.org/u?cross-subdomain", sleeper=Mock(),
+            )
+        self.assertEqual(cross_subdomain["status"], "resolved")
+        self.assertEqual(cross_subdomain["target_url"], "https://dotnet.microsoft.com/")
+        self.assertEqual(cross_subdomain["redirect_count"], 2)
+
+        session.reset_mock()
+        session.get.side_effect = [
+            Response(301, f"https://vendor.example/step-{index}")
+            for index in range(1, 22)
+        ]
+        sleeper.reset_mock()
+        with patch("nctl.report_excel._http_session", return_value=session):
+            too_many = resolve_nessus_reference(
+                "https://nessus.org/u?loop", sleeper=sleeper,
+            )
+        self.assertEqual(too_many["status"], "too_many_redirects")
+        self.assertEqual(too_many["attempts"], 1)
+        self.assertEqual(too_many["redirect_count"], 21)
+        sleeper.assert_not_called()
+
+        session.reset_mock()
+        session.get.side_effect = [
+            Response(301, "https://vendor.example/a"),
+            Response(302, "https://vendor.example/b"),
+            Response(307, "https://vendor.example/a"),
+        ]
+        sleeper.reset_mock()
+        with patch("nctl.report_excel._http_session", return_value=session):
+            loop = resolve_nessus_reference(
+                "https://nessus.org/u?loop", sleeper=sleeper,
+            )
+        self.assertEqual(loop["status"], "redirect_loop")
+        self.assertEqual(loop["attempts"], 1)
+        self.assertEqual(loop["redirect_count"], 3)
+        sleeper.assert_not_called()
+
+        session.reset_mock()
+        session.get.side_effect = [
+            requests.Timeout("first"),
+            requests.ConnectionError("second"),
+            Response(301, "https://vendor.example/advisory"),
+            Response(200),
+        ]
+        sleeper.reset_mock()
+        with patch("nctl.report_excel._http_session", return_value=session):
+            recovered = resolve_nessus_reference(
+                "https://nessus.org/u?retry", sleeper=sleeper,
+            )
+        self.assertEqual(recovered["status"], "resolved")
+        self.assertEqual(recovered["attempts"], 3)
+        self.assertEqual(recovered["attempt_statuses"], [
+            "request_error", "request_error", "resolved",
+        ])
+        self.assertEqual([call.args[0] for call in sleeper.call_args_list], [1.0, 2.0])
+
+    def test_each_retryable_resolution_status_retries(self):
+        class Response:
+            def __init__(self, status_code, location=None):
+                self.status_code = status_code
+                self.headers = {} if location is None else {"Location": location}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        cases = {
+            "access_restricted": [
+                Response(301, "https://protected.example/advisory"), Response(403),
+                Response(301, "https://protected.example/advisory"), Response(403),
+            ],
+            "shortener_not_redirect": [Response(200), Response(200)],
+            "missing_location": [Response(301), Response(301)],
+            "target_unavailable": [
+                Response(301, "https://vendor.example/advisory"), Response(503),
+                Response(301, "https://vendor.example/advisory"), Response(503),
+            ],
+            "request_error": [requests.Timeout("first"), requests.Timeout("second")],
+        }
+        for expected_status, responses in cases.items():
+            with self.subTest(status=expected_status):
+                session = Mock()
+                session.get.side_effect = responses
+                sleeper = Mock()
+                with patch("nctl.report_excel._http_session", return_value=session):
+                    result = resolve_nessus_reference(
+                        "https://nessus.org/u?retryable",
+                        retries=1,
+                        sleeper=sleeper,
+                    )
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(result["attempts"], 2)
+                self.assertEqual(result["attempt_statuses"], [expected_status] * 2)
+                sleeper.assert_called_once_with(1.0)
 
     def test_resolved_workbook_places_references_immediately_after_see_also(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, destination = root / "merged.xlsx", root / "merged_resolved.xlsx"
+            lookup = root / "merged_resolved_lookup.xlsx"
             write_xlsx(source, [[
-                "Source", "References", "Name", "See Also", "CVE", "Extra",
+                "Source", "References", "Name", "Risk", "See Also", "CVE", "Extra",
             ], [
-                "Scan A", "https://existing.example/reference", "Finding",
+                "Scan A", "https://existing.example/reference", "Finding", "High",
                 "http://www.nessus.org/u?good\nhttps://nessus.org/u?dead\n"
-                "https://vendor.example/direct",
+                "https://nessus.org/u?restricted\n"
+                "https://vendor.example/direct\nhttps://vendor.example/missing",
                 "CVE-1", "kept",
             ], [
-                "Scan B", "", "Finding 2", "https://nessus.org/u?good", "", "also kept",
+                "Scan B", "", "Finding 2", "Medium", "https://nessus.org/u?good",
+                "", "also kept",
+            ], [
+                "Scan C", "", "Informational finding", "None",
+                "https://nessus.org/u?good\nhttps://nessus.org/u?none", "", "not resolved",
             ]])
 
+            resolver_inputs = []
+
             def resolver(url):
+                resolver_inputs.append(url)
                 if url.endswith("?good"):
+                    return {
+                        "source_url": url,
+                        "target_url": "https://vendor.example/advisory",
+                        "status": "resolved",
+                    }
+                if url.endswith("?restricted"):
+                    return {
+                        "source_url": url,
+                        "target_url": "https://protected.example/advisory",
+                        "status": "access_restricted",
+                        "http_status": 403,
+                        "attempts": 4,
+                    }
+                if url.endswith("?none"):
+                    return {
+                        "source_url": url,
+                        "target_url": "https://vendor.example/informational",
+                        "status": "resolved",
+                    }
+                if url == "https://vendor.example/direct":
                     return {
                         "source_url": url,
                         "target_url": "https://vendor.example/advisory",
@@ -308,25 +529,77 @@ class ExcelReportTests(unittest.TestCase):
                 progress=lambda completed, total: progress.append((completed, total)),
             )
             self.assertEqual(read_xlsx(destination), [[
-                "Source", "Name", "See Also", "References", "CVE", "Extra",
+                "Source", "Name", "Risk", "See Also", "References", "CVE", "Extra",
             ], [
-                "Scan A", "Finding",
+                "Scan A", "Finding", "High",
                 "http://www.nessus.org/u?good\nhttps://nessus.org/u?dead\n"
-                "https://vendor.example/direct",
-                "https://existing.example/reference\nhttps://vendor.example/advisory",
+                "https://nessus.org/u?restricted\n"
+                "https://vendor.example/direct\nhttps://vendor.example/missing",
+                "https://existing.example/reference\nhttps://vendor.example/advisory\n"
+                "https://protected.example/advisory",
                 "CVE-1", "kept",
             ], [
-                "Scan B", "Finding 2", "https://nessus.org/u?good",
+                "Scan B", "Finding 2", "Medium", "https://nessus.org/u?good",
                 "https://vendor.example/advisory", "", "also kept",
+            ], [
+                "Scan C", "Informational finding", "None",
+                "https://nessus.org/u?good\nhttps://nessus.org/u?none",
+                "https://vendor.example/advisory\nhttps://vendor.example/informational",
+                "", "not resolved",
             ]])
-            self.assertEqual(result["urls_found"], 3)
-            self.assertEqual(result["unique_urls"], 2)
-            self.assertEqual(result["resolved_urls"], 1)
-            self.assertEqual(result["rejected_urls"], 1)
-            self.assertEqual(result["status_counts"], {
-                "resolved": 1, "target_unavailable": 1,
+            self.assertEqual(set(resolver_inputs), {
+                "http://www.nessus.org/u?good", "https://nessus.org/u?dead",
+                "https://nessus.org/u?restricted", "https://nessus.org/u?none",
+                "https://vendor.example/direct", "https://vendor.example/missing",
             })
-            self.assertEqual(progress, [(2, 2)])
+            self.assertEqual(result["urls_found"], 8)
+            self.assertEqual(result["unique_urls"], 6)
+            self.assertEqual(result["resolved_urls"], 4)
+            self.assertEqual(result["access_restricted_urls"], 1)
+            self.assertEqual(result["rejected_urls"], 2)
+            self.assertEqual(result["status_counts"], {
+                "access_restricted": 1, "resolved": 3, "target_unavailable": 2,
+            })
+            self.assertEqual(result["lookup_file"], lookup.name)
+            self.assertEqual(result["lookup_rows"], 6)
+            self.assertEqual(read_xlsx(lookup), [[
+                "Source URL", "Normalized URL", "Occurrences", "Decision", "Resolved URL",
+                "Technical Status", "HTTP Status", "Attempts", "Redirect Count",
+                "Redirect Chain", "Reason",
+            ], [
+                "http://www.nessus.org/u?good\nhttps://nessus.org/u?good",
+                "https://api.tenable.com/v1/u?good", "3", "Giữ",
+                "https://vendor.example/advisory", "resolved", "",
+                "1", "0", "",
+                "URL đích trả HTTP 2xx và không redirect thêm.",
+            ], [
+                "https://nessus.org/u?dead", "https://api.tenable.com/v1/u?dead", "1",
+                "Bỏ qua", "", "target_unavailable", "404",
+                "1", "0", "",
+                "URL đích không trả về HTTP 2xx.",
+            ], [
+                "https://nessus.org/u?restricted",
+                "https://api.tenable.com/v1/u?restricted", "1",
+                "Giữ", "https://protected.example/advisory",
+                "access_restricted", "403", "4", "0", "",
+                "URL đích trả HTTP 401/403 cho client tự động; vẫn giữ vì đã resolve được URL đích. Đã thử 4 lần.",
+            ], [
+                "https://vendor.example/direct", "https://vendor.example/direct", "1",
+                "Giữ", "https://vendor.example/advisory", "resolved", "",
+                "1", "0", "",
+                "URL đích trả HTTP 2xx và không redirect thêm.",
+            ], [
+                "https://vendor.example/missing", "https://vendor.example/missing", "1",
+                "Bỏ qua", "", "target_unavailable", "404",
+                "1", "0", "",
+                "URL đích không trả về HTTP 2xx.",
+            ], [
+                "https://nessus.org/u?none", "https://api.tenable.com/v1/u?none", "1",
+                "Giữ", "https://vendor.example/informational", "resolved", "",
+                "1", "0", "",
+                "URL đích trả HTTP 2xx và không redirect thêm.",
+            ]])
+            self.assertEqual(progress, [(6, 6)])
 
     def test_reflow_narrative_removes_soft_wraps_and_keeps_structure(self):
         source = (
@@ -656,7 +929,10 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(client.export_csv.call_count, 3)
                 self.assertTrue((root / "merged.xlsx").exists())
                 self.assertTrue((root / "merged_resolved.xlsx").exists())
+                self.assertTrue((root / "merged_resolved_lookup.xlsx").exists())
                 self.assertEqual(manifest["resolved"]["references_column_after"], "See Also")
+                self.assertEqual(manifest["resolved"]["lookup_file"],
+                                 "merged_resolved_lookup.xlsx")
                 for item in manifest["files"]:
                     original_rows = read_xlsx(root / item["file"])
                     self.assertEqual(original_rows[0], ["id", "Host", "Name", "Risk", "output", "Group"])
@@ -725,6 +1001,7 @@ class ReportTests(unittest.TestCase):
                 root = next(Path(directory).iterdir())
                 self.assertTrue((root / "merged.xlsx").exists())
                 self.assertTrue((root / "merged_resolved.xlsx").exists())
+                self.assertTrue((root / "merged_resolved_lookup.xlsx").exists())
                 self.assertIn("Tự động bật merge", output.getvalue())
 
     def test_one_scan_does_not_auto_merge_without_option(self):
@@ -743,6 +1020,7 @@ class ReportTests(unittest.TestCase):
             root = next(Path(directory).iterdir())
             self.assertFalse((root / "merged.xlsx").exists())
             self.assertFalse((root / "merged_resolved.xlsx").exists())
+            self.assertFalse((root / "merged_resolved_lookup.xlsx").exists())
 
     def test_all_failed_exports_do_not_create_merged_excel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -783,16 +1061,32 @@ class OfflineMergeTests(unittest.TestCase):
                 "udp/53", "Already combined", "Fix", "evidence", "https://existing.test",
                 "CVE-3", "kept",
             ]])
+
+            def resolve_direct(url, **_):
+                return {
+                    "source_url": url,
+                    "target_url": url,
+                    "status": "resolved",
+                    "http_status": 200,
+                    "attempts": 1,
+                    "redirect_count": 0,
+                    "redirect_chain": [url],
+                }
+
             output = io.StringIO()
             with patch("nctl.app._load_config") as load_config, \
+                    patch("nctl.report_excel.resolve_nessus_reference",
+                          side_effect=resolve_direct), \
                     patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
                 self.assertEqual(main(["merge", str(root)]), 0)
                 load_config.assert_not_called()
             merged = root / "merged.xlsx"
             resolved = root / "merged_resolved.xlsx"
+            lookup = root / "merged_resolved_lookup.xlsx"
             manifest_path = root / "merged.manifest.json"
             self.assertTrue(merged.exists())
             self.assertTrue(resolved.exists())
+            self.assertTrue(lookup.exists())
             self.assertTrue(manifest_path.exists())
             self.assertEqual(read_xlsx(merged), [
                 ["Source", "Group", "Name", "Risk", "Host", "Location", "Description",
@@ -810,17 +1104,38 @@ class OfflineMergeTests(unittest.TestCase):
             self.assertEqual(manifest["input_rows"], 3)
             self.assertEqual(manifest["duplicates_removed"], 1)
             self.assertEqual(Path(manifest["resolved"]["output"]).resolve(), resolved.resolve())
-            resolved_header = read_xlsx(resolved)[0]
+            self.assertEqual(Path(manifest["resolved"]["lookup_output"]).resolve(), lookup.resolve())
+            self.assertEqual(manifest["resolved"]["lookup_rows"], 2)
+            lookup_rows = read_xlsx(lookup)
+            self.assertEqual(lookup_rows[0], [
+                "Source URL", "Normalized URL", "Occurrences", "Decision", "Resolved URL",
+                "Technical Status", "HTTP Status", "Attempts", "Redirect Count",
+                "Redirect Chain", "Reason",
+            ])
+            self.assertEqual({row[0] for row in lookup_rows[1:]}, {
+                "https://existing.test", "https://example.test",
+            })
+            self.assertTrue(all(row[3] == "Giữ" and row[5] == "resolved"
+                                for row in lookup_rows[1:]))
+            resolved_rows = read_xlsx(resolved)
+            resolved_header = resolved_rows[0]
             self.assertEqual(resolved_header[resolved_header.index("See Also") + 1], "References")
+            references_index = resolved_header.index("References")
+            self.assertEqual({row[references_index] for row in resolved_rows[1:]}, {
+                "https://existing.test", "https://example.test",
+            })
             self.assertIn("Merge offline 2 file", output.getvalue())
 
             # The current output is excluded when the command is run again.
             with patch("nctl.app._load_config") as load_config, \
+                    patch("nctl.report_excel.resolve_nessus_reference",
+                          side_effect=resolve_direct), \
                     patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
                 self.assertEqual(main(["merge", "--folder", str(root)]), 0)
                 load_config.assert_not_called()
             self.assertEqual(len(read_xlsx(merged)), 3)
             self.assertEqual(len(read_xlsx(resolved)), 3)
+            self.assertEqual(len(read_xlsx(lookup)), 3)
 
     def test_merge_folder_requires_supported_input(self):
         with tempfile.TemporaryDirectory() as directory, \

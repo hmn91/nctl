@@ -22,6 +22,8 @@ from .report_excel import export_scan_xlsx, merge_scan_xlsx, resolve_references_
 
 
 DEFAULT_URL = "https://127.0.0.1:11127"
+DEFAULT_BACKUP_OUTPUT = str(Path("data") / "backups")
+DEFAULT_REPORT_OUTPUT = str(Path("data") / "reports")
 # Preserve the historical DB secret so existing backups remain restorable.
 DEFAULT_DB_PASSWORD = "NessusDB@2026"
 TERMINAL_SCAN_STATES = {"completed", "canceled", "cancelled", "aborted", "stopped", "empty", "imported"}
@@ -525,11 +527,13 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                     f"đã giữ {detail['saved_length']} ký tự và highlight ô."
                 )
             resolved = report_dir / "merged_resolved.xlsx"
-            print(f"Resolve URL nessus.org và tạo {resolved.name}...")
+            resolved_lookup = report_dir / "merged_resolved_lookup.xlsx"
+            print(f"Resolve URL trong See Also và tạo {resolved.name}...")
             try:
                 resolved_result = resolve_references_xlsx(
                     merged,
                     resolved,
+                    lookup_destination=resolved_lookup,
                     existing_truncations=merge_result["truncated_details"],
                     progress=lambda completed, total: print(
                         f"  Resolve URL: {completed}/{total}"
@@ -546,26 +550,40 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
             else:
                 manifest["resolved"] = {
                     "file": resolved.name,
+                    "lookup_file": resolved_lookup.name,
+                    "lookup_rows": resolved_result["lookup_rows"],
                     "rows": resolved_result["rows"],
                     "source_file": merged.name,
                     "references_column_after": "See Also",
                     "urls_found": resolved_result["urls_found"],
                     "unique_urls": resolved_result["unique_urls"],
                     "resolved_urls": resolved_result["resolved_urls"],
+                    "access_restricted_urls": resolved_result["access_restricted_urls"],
                     "rejected_urls": resolved_result["rejected_urls"],
                     "status_counts": resolved_result["status_counts"],
                     "resolution_details": resolved_result["resolution_details"],
                     "truncated_cells": resolved_result["truncated_cells"],
                     "truncated_details": resolved_result["truncated_details"],
+                    "lookup_truncated_cells": resolved_result["lookup_truncated_cells"],
+                    "lookup_truncated_details": resolved_result["lookup_truncated_details"],
                 }
                 print(
-                    f"Đã tạo {resolved}: tìm thấy {resolved_result['urls_found']} URL nessus.org "
+                    f"Đã tạo {resolved}: tìm thấy {resolved_result['urls_found']} URL "
                     f"({resolved_result['unique_urls']} URL unique), resolve thành công "
-                    f"{resolved_result['resolved_urls']}, bỏ qua {resolved_result['rejected_urls']}."
+                    f"{resolved_result['resolved_urls']} "
+                    f"({resolved_result['access_restricted_urls']} URL HTTP 401/403 vẫn giữ), "
+                    f"bỏ qua {resolved_result['rejected_urls']}. "
+                    f"Tra cứu chi tiết: {resolved_lookup}."
                 )
                 for detail in resolved_result["truncated_details"]:
                     print(
                         f"  CẢNH BÁO {resolved.name}: ô {detail['cell']} "
+                        f"({detail['column']}) dài {detail['original_length']} ký tự; "
+                        f"đã giữ {detail['saved_length']} ký tự và highlight ô."
+                    )
+                for detail in resolved_result["lookup_truncated_details"]:
+                    print(
+                        f"  CẢNH BÁO {resolved_lookup.name}: ô {detail['cell']} "
                         f"({detail['column']}) dài {detail['original_length']} ký tự; "
                         f"đã giữ {detail['saved_length']} ký tự và highlight ô."
                     )
@@ -606,7 +624,13 @@ def cmd_merge_files(
     elif destination.suffix.casefold() != ".xlsx":
         raise NctlError("File output của lệnh merge phải có đuôi .xlsx.")
     resolved_destination = destination.with_name(f"{destination.stem}_resolved.xlsx")
-    excluded_outputs = {destination.resolve(), resolved_destination.resolve()}
+    resolved_lookup_destination = destination.with_name(
+        f"{destination.stem}_resolved_lookup.xlsx"
+    )
+    excluded_outputs = {
+        destination.resolve(), resolved_destination.resolve(),
+        resolved_lookup_destination.resolve(),
+    }
     candidates = sorted(
         (
             path for path in folder.iterdir()
@@ -657,11 +681,12 @@ def cmd_merge_files(
         f"Hoàn tất: đọc {input_rows} dòng; loại {duplicates_removed} dòng trùng; "
         f"ghi {result['rows']} dòng vào {destination}."
     )
-    print(f"Resolve URL nessus.org và tạo {resolved_destination.name}...")
+    print(f"Resolve URL trong See Also và tạo {resolved_destination.name}...")
     try:
         resolved_result = resolve_references_xlsx(
             destination,
             resolved_destination,
+            lookup_destination=resolved_lookup_destination,
             existing_truncations=result["truncated_details"],
             progress=lambda completed, total: print(
                 f"  Resolve URL: {completed}/{total}"
@@ -675,17 +700,22 @@ def cmd_merge_files(
         ) from exc
     manifest["resolved"] = {
         "output": str(resolved_destination),
+        "lookup_output": str(resolved_lookup_destination),
+        "lookup_rows": resolved_result["lookup_rows"],
         "rows": resolved_result["rows"],
         "source_file": destination.name,
         "references_column_after": "See Also",
         "urls_found": resolved_result["urls_found"],
         "unique_urls": resolved_result["unique_urls"],
         "resolved_urls": resolved_result["resolved_urls"],
+        "access_restricted_urls": resolved_result["access_restricted_urls"],
         "rejected_urls": resolved_result["rejected_urls"],
         "status_counts": resolved_result["status_counts"],
         "resolution_details": resolved_result["resolution_details"],
         "truncated_cells": resolved_result["truncated_cells"],
         "truncated_details": resolved_result["truncated_details"],
+        "lookup_truncated_cells": resolved_result["lookup_truncated_cells"],
+        "lookup_truncated_details": resolved_result["lookup_truncated_details"],
     }
     _write_manifest(manifest_path, manifest)
     for detail in resolved_result["truncated_details"]:
@@ -694,11 +724,19 @@ def cmd_merge_files(
             f"({detail['column']}) dài {detail['original_length']} ký tự; "
             f"đã giữ {detail['saved_length']} ký tự và highlight ô."
         )
+    for detail in resolved_result["lookup_truncated_details"]:
+        print(
+            f"  CẢNH BÁO {resolved_lookup_destination.name}: ô {detail['cell']} "
+            f"({detail['column']}) dài {detail['original_length']} ký tự; "
+            f"đã giữ {detail['saved_length']} ký tự và highlight ô."
+        )
     print(
-        f"Đã tạo {resolved_destination}: tìm thấy {resolved_result['urls_found']} URL nessus.org "
+        f"Đã tạo {resolved_destination}: tìm thấy {resolved_result['urls_found']} URL "
         f"({resolved_result['unique_urls']} URL unique), resolve thành công "
-        f"{resolved_result['resolved_urls']}, bỏ qua {resolved_result['rejected_urls']}. "
-        f"Manifest: {manifest_path}"
+        f"{resolved_result['resolved_urls']} "
+        f"({resolved_result['access_restricted_urls']} URL HTTP 401/403 vẫn giữ), "
+        f"bỏ qua {resolved_result['rejected_urls']}. "
+        f"Tra cứu chi tiết: {resolved_lookup_destination}. Manifest: {manifest_path}"
     )
     return 0
 
@@ -1629,7 +1667,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bao gồm scan trong Trash (mặc định bỏ qua)",
     )
     backup.add_argument("--history", default="all", help="all, latest hoặc history ID (mặc định: all)")
-    backup.add_argument("--output", default="backups", help="Thư mục chứa lượt backup")
+    backup.add_argument(
+        "--output", default=DEFAULT_BACKUP_OUTPUT,
+        help=f"Thư mục chứa lượt backup (mặc định: {DEFAULT_BACKUP_OUTPUT})",
+    )
     backup.add_argument("--poll-interval", type=float, default=1.0, help="Chu kỳ kiểm tra export")
     backup.add_argument("--export-timeout", type=float, default=1800, help="Timeout mỗi export")
     backup.set_defaults(handler=cmd_backup)
@@ -1642,7 +1683,10 @@ def build_parser() -> argparse.ArgumentParser:
     report_selector.add_argument("--folders", nargs="+", help="Nhiều folder ID/tên, cách bằng dấu cách hoặc dấu phẩy")
     report_selector.add_argument("--all", action="store_true", help="Toàn bộ scan (mặc định bỏ qua Trash)")
     report.add_argument("--include-trash", action="store_true", help="Bao gồm Trash khi dùng --all")
-    report.add_argument("--output", default="reports", help="Thư mục chứa lượt report (mặc định: reports)")
+    report.add_argument(
+        "--output", default=DEFAULT_REPORT_OUTPUT,
+        help=f"Thư mục chứa lượt report (mặc định: {DEFAULT_REPORT_OUTPUT})",
+    )
     report.add_argument(
         "--merge", action="store_true",
         help="Gộp thêm merged.xlsx khi chỉ chọn 1 scan; từ 2 scan trở lên tự động merge",

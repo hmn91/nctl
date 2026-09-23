@@ -6,6 +6,7 @@ import csv
 import posixpath
 import re
 import threading
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter
@@ -46,6 +47,28 @@ _SHORT_HEADING = re.compile(r"^.{1,80}:$")
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _HTTP_LOCAL = threading.local()
+_RETRYABLE_RESOLUTION_STATUSES = {
+    "access_restricted",
+    "shortener_not_redirect",
+    "missing_location",
+    "target_unavailable",
+    "request_error",
+}
+_KEPT_RESOLUTION_STATUSES = {"resolved", "access_restricted"}
+_RESOLUTION_REASONS = {
+    "resolved": "URL đích trả HTTP 2xx và không redirect thêm.",
+    "access_restricted": (
+        "URL đích trả HTTP 401/403 cho client tự động; vẫn giữ vì đã resolve được URL đích."
+    ),
+    "shortener_not_redirect": "URL rút gọn không trả về redirect.",
+    "missing_location": "Phản hồi redirect không có header Location.",
+    "too_many_redirects": "Chuỗi URL vượt quá giới hạn 20 redirect.",
+    "redirect_loop": "Chuỗi redirect quay lại URL đã đi qua.",
+    "redirected_to_homepage": "URL trang con chuyển về trang chủ cùng domain; có thể nội dung gốc không còn tồn tại.",
+    "target_unavailable": "URL đích không trả về HTTP 2xx.",
+    "request_error": "Không kết nối được, timeout hoặc lỗi HTTP client.",
+    "resolver_error": "Lỗi nội bộ khi xử lý URL.",
+}
 
 
 def _csv_header(reader: Any, path: Path) -> list[str]:
@@ -312,13 +335,31 @@ def _write_workbook(
     }
 
 
-def _extract_nessus_urls(value: str) -> list[str]:
-    urls: list[str] = []
-    for match in _URL.finditer(str(value or "")):
-        url = match.group(0).rstrip(".,;)]}")
+def _is_nessus_shortener(url: str) -> bool:
+    try:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").casefold()
-        if (host == "nessus.org" or host.endswith(".nessus.org")) and parsed.path.rstrip("/") == "/u":
+    except ValueError:
+        return False
+    return (
+        (host == "nessus.org" or host.endswith(".nessus.org"))
+        and parsed.path.rstrip("/") == "/u"
+    )
+
+
+def _extract_reference_urls(value: str) -> list[str]:
+    urls: list[str] = []
+    for match in _URL.finditer(str(value or "")):
+        url = match.group(0).rstrip(".,;")
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while url.endswith(closing) and url.count(closing) > url.count(opening):
+                url = url[:-1]
+        try:
+            parsed = urlsplit(url)
+            valid = parsed.scheme.casefold() in {"http", "https"} and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if valid:
             urls.append(url)
     return urls
 
@@ -328,61 +369,180 @@ def _shortener_url(url: str) -> str:
     return urlunsplit(("https", "api.tenable.com", "/v1/u", parsed.query, ""))
 
 
+def _resolution_endpoint(url: str) -> str:
+    return _shortener_url(url) if _is_nessus_shortener(url) else url
+
+
+def _redirect_loop_key(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit((
+        parsed.scheme.casefold(), parsed.netloc.casefold(), parsed.path or "/", parsed.query, "",
+    ))
+
+
+def _canonical_reference_url(url: str) -> str:
+    return _redirect_loop_key(_resolution_endpoint(url))
+
+
+def _reference_unique_key(value: str) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme.casefold() in {"http", "https"} and parsed.hostname:
+            return _redirect_loop_key(text)
+    except ValueError:
+        pass
+    return text.casefold()
+
+
 def _http_session() -> requests.Session:
     session = getattr(_HTTP_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "nctl-reference-resolver/2.6",
+            "User-Agent": "nctl-reference-resolver/2.6.1",
             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         })
         _HTTP_LOCAL.session = session
     return session
 
 
-def resolve_nessus_reference(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
-    """Resolve one Nessus short URL and reject a redirect from its target."""
-    endpoint = _shortener_url(url)
+def _is_homepage_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    path = parsed.path.casefold().rstrip("/")
+    return path in {"", "/index", "/index.html", "/index.htm", "/home", "/homepage"}
+
+
+def _redirects_subpage_to_homepage(current: str, target: str) -> bool:
+    current_parsed = urlsplit(current)
+    target_parsed = urlsplit(target)
+    current_host = (current_parsed.hostname or "").casefold().removeprefix("www.")
+    target_host = (target_parsed.hostname or "").casefold().removeprefix("www.")
+    return (
+        bool(current_host and target_host and current_host == target_host)
+        and not _is_homepage_url(current)
+        and _is_homepage_url(target)
+    )
+
+
+def _resolve_nessus_reference_once(
+    url: str, *, timeout: float, max_redirects: int,
+) -> dict[str, Any]:
+    is_shortener = _is_nessus_shortener(url)
+    endpoint = _resolution_endpoint(url)
+    current = endpoint
+    redirect_chain = [endpoint]
+    visited = {_redirect_loop_key(endpoint)}
+    redirect_count = 0
     try:
-        with _http_session().get(
-            endpoint, allow_redirects=False, stream=True, timeout=timeout,
-        ) as short_response:
-            if short_response.status_code not in _REDIRECT_STATUSES:
+        while True:
+            with _http_session().get(
+                current, allow_redirects=False, stream=True, timeout=timeout,
+            ) as response:
+                http_status = response.status_code
+                location = response.headers.get("Location", "").strip()
+            if http_status in _REDIRECT_STATUSES:
+                if not location:
+                    return {
+                        "source_url": url, "status": "missing_location",
+                        "http_status": http_status, "redirect_count": redirect_count,
+                        "redirect_chain": redirect_chain,
+                    }
+                target = urljoin(current, location)
+                redirect_count += 1
+                redirect_chain.append(target)
+                target_key = _redirect_loop_key(target)
+                if target_key in visited:
+                    return {
+                        "source_url": url, "target_url": target,
+                        "status": "redirect_loop", "http_status": http_status,
+                        "redirect_count": redirect_count,
+                        "redirect_chain": redirect_chain,
+                    }
+                if redirect_count > max_redirects:
+                    return {
+                        "source_url": url, "target_url": target,
+                        "status": "too_many_redirects", "http_status": http_status,
+                        "redirect_count": redirect_count,
+                        "redirect_chain": redirect_chain,
+                    }
+                if _redirects_subpage_to_homepage(current, target):
+                    return {
+                        "source_url": url, "target_url": target,
+                        "status": "redirected_to_homepage", "http_status": http_status,
+                        "redirect_count": redirect_count,
+                        "redirect_chain": redirect_chain,
+                    }
+                visited.add(target_key)
+                current = target
+                continue
+            if redirect_count == 0 and is_shortener:
                 return {
                     "source_url": url, "status": "shortener_not_redirect",
-                    "http_status": short_response.status_code,
+                    "http_status": http_status, "redirect_count": 0,
+                    "redirect_chain": redirect_chain,
                 }
-            location = short_response.headers.get("Location", "").strip()
-            if not location:
-                return {"source_url": url, "status": "missing_location"}
-            target = urljoin(endpoint, location)
-        with _http_session().get(
-            target, allow_redirects=False, stream=True, timeout=timeout,
-        ) as target_response:
-            if target_response.status_code in _REDIRECT_STATUSES:
+            if http_status in {401, 403}:
                 return {
-                    "source_url": url, "target_url": target,
-                    "status": "target_redirects_again",
-                    "http_status": target_response.status_code,
+                    "source_url": url, "target_url": current,
+                    "status": "access_restricted", "http_status": http_status,
+                    "redirect_count": redirect_count,
+                    "redirect_chain": redirect_chain,
                 }
-            if not 200 <= target_response.status_code < 300:
+            if not 200 <= http_status < 300:
                 return {
-                    "source_url": url, "target_url": target,
-                    "status": "target_unavailable",
-                    "http_status": target_response.status_code,
+                    "source_url": url, "target_url": current,
+                    "status": "target_unavailable", "http_status": http_status,
+                    "redirect_count": redirect_count,
+                    "redirect_chain": redirect_chain,
                 }
-        return {"source_url": url, "target_url": target, "status": "resolved"}
+            return {
+                "source_url": url, "target_url": current, "status": "resolved",
+                "http_status": http_status, "redirect_count": redirect_count,
+                "redirect_chain": redirect_chain,
+            }
     except requests.RequestException as exc:
         return {
             "source_url": url, "status": "request_error",
             "error": f"{type(exc).__name__}: {exc}",
+            "redirect_count": redirect_count,
+            "redirect_chain": redirect_chain,
         }
+
+
+def resolve_nessus_reference(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    max_redirects: int = 20,
+    retries: int = 3,
+    retry_delay: float = 1.0,
+    sleeper: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
+    """Resolve an HTTP(S) reference with bounded redirects and retries."""
+    if max_redirects < 0 or retries < 0 or retry_delay < 0:
+        raise NctlError("max_redirects, retries và retry_delay không được âm.")
+    pause = sleeper or time.sleep
+    history: list[str] = []
+    for attempt in range(1, retries + 2):
+        result = _resolve_nessus_reference_once(
+            url, timeout=timeout, max_redirects=max_redirects,
+        )
+        status = str(result.get("status") or "unknown")
+        history.append(status)
+        result["attempts"] = attempt
+        result["attempt_statuses"] = list(history)
+        if status not in _RETRYABLE_RESOLUTION_STATUSES or attempt > retries:
+            return result
+        pause(retry_delay * (2 ** (attempt - 1)))
+    raise AssertionError("Resolver retry loop ended unexpectedly.")
 
 
 def resolve_references_xlsx(
     source: Path,
     destination: Path,
     *,
+    lookup_destination: Path | None = None,
     existing_truncations: Sequence[dict[str, Any]] | None = None,
     timeout: float = 10.0,
     workers: int = 16,
@@ -399,26 +559,30 @@ def resolve_references_xlsx(
     see_also_index = next(
         (index for index, name in enumerate(header) if name.casefold() == "see also"), None
     )
-    # Different legacy schemes/hosts can point at the same Tenable short key.
-    # Resolve each canonical shortener endpoint only once.
+    # Different legacy Nessus schemes/hosts can point at the same Tenable short key.
+    # Direct URLs are normalized without fragments and each canonical URL is resolved once.
     ordered_urls: dict[str, str] = {}
+    source_url_counts: dict[str, Counter[str]] = {}
     occurrences = 0
     if see_also_index is not None:
         for row in first_pass:
             value = row[see_also_index] if see_also_index < len(row) else ""
-            urls = _extract_nessus_urls(value)
+            urls = _extract_reference_urls(value)
             occurrences += len(urls)
             for url in urls:
-                ordered_urls.setdefault(_shortener_url(url), url)
+                canonical = _canonical_reference_url(url)
+                ordered_urls.setdefault(canonical, url)
+                source_url_counts.setdefault(canonical, Counter())[url] += 1
 
     resolve_one = resolver or (lambda url: resolve_nessus_reference(url, timeout=timeout))
     results: dict[str, dict[str, Any]] = {}
-    total = len(ordered_urls)
-    if total:
-        with ThreadPoolExecutor(max_workers=min(workers, total)) as executor:
+    urls_to_resolve = dict(ordered_urls)
+    resolve_total = len(urls_to_resolve)
+    if resolve_total:
+        with ThreadPoolExecutor(max_workers=min(workers, resolve_total)) as executor:
             futures = {
                 executor.submit(resolve_one, url): canonical
-                for canonical, url in ordered_urls.items()
+                for canonical, url in urls_to_resolve.items()
             }
             for completed, future in enumerate(as_completed(futures), 1):
                 canonical = futures[future]
@@ -430,8 +594,10 @@ def resolve_references_xlsx(
                         "source_url": url, "status": "resolver_error",
                         "error": f"{type(exc).__name__}: {exc}",
                     }
-                if progress is not None and (completed == total or completed % 25 == 0):
-                    progress(completed, total)
+                if progress is not None and (
+                    completed == resolve_total or completed % 25 == 0
+                ):
+                    progress(completed, resolve_total)
 
     source_references_index = next(
         (index for index, name in enumerate(header) if name.casefold() == "references"), None
@@ -455,33 +621,92 @@ def resolve_references_xlsx(
             if not any(row) or row == header:
                 continue
             row = _fit_row(row, header, source, row_number)
-            links: dict[str, None] = {}
+            links: dict[str, str] = {}
+
+            def add_link(link: str) -> None:
+                cleaned = str(link or "").strip()
+                if cleaned:
+                    links.setdefault(_reference_unique_key(cleaned), cleaned)
+
             if source_references_index is not None:
                 for link in str(row[source_references_index] or "").splitlines():
-                    if link.strip():
-                        links.setdefault(link.strip(), None)
+                    add_link(link)
             if see_also_index is not None:
-                for url in _extract_nessus_urls(row[see_also_index]):
-                    result = results.get(_shortener_url(url), {})
-                    if result.get("status") == "resolved" and result.get("target_url"):
-                        links.setdefault(str(result["target_url"]), None)
+                for url in _extract_reference_urls(row[see_also_index]):
+                    result = results.get(_canonical_reference_url(url), {})
+                    if (
+                        result.get("status") in _KEPT_RESOLUTION_STATUSES
+                        and result.get("target_url")
+                    ):
+                        add_link(str(result["target_url"]))
             if source_references_index is not None:
                 del row[source_references_index]
-            row.insert(references_index, "\n".join(links))
+            row.insert(references_index, "\n".join(links.values()))
             yield row
 
     workbook_result = _write_workbook(
         destination, columns, rows(), existing_truncations=existing_truncations,
     )
     status_counts = Counter(result.get("status", "unknown") for result in results.values())
+    resolution_details: list[dict[str, Any]] = []
+    for canonical in ordered_urls:
+        detail = dict(results[canonical])
+        detail["normalized_url"] = canonical
+        detail["source_urls"] = list(source_url_counts[canonical])
+        detail["occurrences"] = sum(source_url_counts[canonical].values())
+        resolution_details.append(detail)
+
+    lookup_destination = lookup_destination or destination.with_name(
+        f"{destination.stem}_lookup.xlsx"
+    )
+    lookup_columns = [
+        "Source URL", "Normalized URL", "Occurrences", "Decision", "Resolved URL",
+        "Technical Status", "HTTP Status", "Attempts", "Redirect Count",
+        "Redirect Chain", "Reason",
+    ]
+
+    def lookup_rows() -> Iterator[list[str]]:
+        for detail in resolution_details:
+            status = str(detail.get("status") or "unknown")
+            reason = _RESOLUTION_REASONS.get(status, "Trạng thái xử lý không xác định.")
+            if detail.get("error"):
+                reason = f"{reason} {detail['error']}"
+            attempts_value = detail.get("attempts")
+            attempts = 1 if attempts_value is None else int(attempts_value)
+            if attempts > 1:
+                reason = f"{reason} Đã thử {attempts} lần."
+            yield [
+                "\n".join(str(url) for url in detail["source_urls"]),
+                str(detail["normalized_url"]),
+                str(detail["occurrences"]),
+                "Giữ" if status in _KEPT_RESOLUTION_STATUSES else "Bỏ qua",
+                str(detail.get("target_url") or ""),
+                status,
+                str(detail.get("http_status") or ""),
+                str(attempts),
+                str(detail.get("redirect_count") or 0),
+                "\n".join(str(item) for item in detail.get("redirect_chain") or []),
+                reason,
+            ]
+
+    lookup_result = _write_workbook(lookup_destination, lookup_columns, lookup_rows())
+    kept_urls = sum(
+        count for status, count in status_counts.items()
+        if status in _KEPT_RESOLUTION_STATUSES
+    )
     return {
         **workbook_result,
         "urls_found": occurrences,
-        "unique_urls": total,
-        "resolved_urls": status_counts.get("resolved", 0),
-        "rejected_urls": total - status_counts.get("resolved", 0),
+        "unique_urls": len(ordered_urls),
+        "resolved_urls": kept_urls,
+        "access_restricted_urls": status_counts.get("access_restricted", 0),
+        "rejected_urls": len(ordered_urls) - kept_urls,
         "status_counts": dict(sorted(status_counts.items())),
-        "resolution_details": [results[canonical] for canonical in ordered_urls],
+        "resolution_details": resolution_details,
+        "lookup_file": lookup_destination.name,
+        "lookup_rows": lookup_result["rows"],
+        "lookup_truncated_cells": lookup_result["truncated_cells"],
+        "lookup_truncated_details": lookup_result["truncated_details"],
     }
 
 

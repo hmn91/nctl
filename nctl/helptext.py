@@ -89,7 +89,7 @@ Folder nhận ID hoặc tên, không phân biệt hoa thường.
 Mặc định backup mọi history của scan đã chọn; Trash bị bỏ qua.
 Mỗi lượt dùng chung mật khẩu DB, hỏi một lần; Enter dùng mật khẩu mặc định.
 --all giữ cấu trúc folder thực tế, kể cả folder rỗng (trừ Trash mặc định).
-Thư mục output: nctl-backup-YYYYMMDD-HHMMSS, kèm manifest.json.
+Output mặc định: data/backups/nctl-backup-YYYYMMDD-HHMMSS, kèm manifest.json.
 Tên file: scan-12_history-35_Ten scan.db; mỗi history là một file riêng.
 Manifest lưu folder gốc, tên file và các lỗi; không lưu mật khẩu.
 Backup cũ vẫn có thể restore mà không cần đổi tên.
@@ -118,7 +118,7 @@ Folder nhận ID hoặc tên, không phân biệt hoa thường; tên có dấu 
 --folders nhận nhiều giá trị cách bằng dấu cách hoặc dấu phẩy; scan/folder trùng chỉ xử lý một lần.
 --all bỏ qua Trash mặc định; --include-trash để lấy cả Trash.
 Chọn rõ scan ID hoặc folder Trash vẫn xuất các scan đó.
-Output mặc định: reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
+Output mặc định: data/reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
 Tên file: scan-12_Ten scan.xlsx; manifest.json ghi các file và lỗi.
 Từ 2 scan thực tế trở lên tự tạo merged.xlsx rồi merged_resolved.xlsx, bất kể đầu vào là list, folder, nhiều folder hay --all.
 Với đúng 1 scan, dùng --merge nếu vẫn muốn tạo file gộp. Các file lẻ luôn được giữ nguyên.
@@ -140,8 +140,15 @@ Các số đếm này cũng được lưu trong manifest.json; không tính head
 Chỉ lọc trùng khi --merge; các file Excel lẻ vẫn giữ nguyên dữ liệu gốc.
 Cột Source ở đầu file gộp ghi tên scan gốc cho từng dòng, giúp lọc khi IP trùng.
 Sau merged.xlsx, chương trình tạo merged_resolved.xlsx với cột References ngay sau See Also.
-Mỗi URL rút gọn dạng /u?... trong See Also chỉ resolve một lần; chỉ giữ URL đích trả HTTP 2xx và không redirect thêm.
-URL hết hạn, lỗi kết nối hoặc redirect lần nữa bị bỏ qua; mỗi URL hợp lệ nằm trên một dòng trong cell.
+Mọi URL HTTP/HTTPS trong See Also đều được resolve, không phụ thuộc giá trị Risk.
+URL rút gọn dạng /u?... được chuẩn hóa qua Tenable; URL đích trùng chỉ xuất hiện một lần trong References.
+Cho phép tối đa 20 redirect nếu không lặp và URL cuối phải trả HTTP 2xx.
+Redirect loop hoặc trang con redirect về trang chủ cùng hostname (không tính www) bị bỏ; chuyển sang subdomain khác vẫn được theo dõi.
+too_many_redirects, redirect_loop và redirected_to_homepage không retry.
+Các lỗi retry tối đa 3 lần, delay 1/2/4 giây: access_restricted, shortener_not_redirect, missing_location, target_unavailable, request_error.
+HTTP 401/403 còn lại sau retry được giữ trong References với trạng thái access_restricted; các lỗi khác bị bỏ.
+Mỗi URL hợp lệ nằm trên một dòng trong cell.
+File merged_resolved_lookup.xlsx ghi từng URL unique, số lần xuất hiện, URL đích, quyết định giữ/bỏ, HTTP status và lý do.
 Manifest ghi số URL tìm thấy/unique/thành công/bị bỏ và chi tiết trạng thái. Bước này cần Internet.
 Tên scan giữ nguyên, không lấy tên file đã thay ký tự; scan thiếu tên dùng scan-ID.
 Giữ nguyên dấu phẩy, dấu ngoặc kép, Unicode và nội dung xuống dòng trong ô.
@@ -162,12 +169,20 @@ Nếu một dòng đã có Source hoặc Group thì giữ giá trị đó; ô tr
 Source thiếu dùng tên file không có phần mở rộng. Group thiếu được phân loại theo cùng quy tắc report.
 Nếu file đã có Location/Description tổng hợp thì giữ nguyên; nếu còn Protocol/Port hoặc Synopsis/Description
 thì tạo Location và Description theo cùng quy tắc merged.xlsx của report.
-Đầu ra mặc định là <folder>/merged.xlsx, <folder>/merged_resolved.xlsx và <folder>/merged.manifest.json.
+Đầu ra mặc định là <folder>/merged.xlsx, <folder>/merged_resolved.xlsx,
+<folder>/merged_resolved_lookup.xlsx và <folder>/merged.manifest.json.
 File gộp áp dụng unique/CVE, thứ tự cột, highlight ô bị rút gọn, header, freeze và Filter như report.
 Synopsis, Description và Solution cũng được bỏ xuống dòng do wrap web; Plugin Output giữ nguyên.
 Sau khi tạo merged.xlsx, lệnh tạo merged_resolved.xlsx với cột References ngay sau See Also.
-Chỉ URL rút gọn dạng /u?... trong See Also được resolve; URL đích phải trả HTTP 2xx và không redirect thêm.
+Mọi URL HTTP/HTTPS trong See Also đều được resolve, không phụ thuộc giá trị Risk.
+URL rút gọn dạng /u?... được chuẩn hóa qua Tenable; URL đích trùng chỉ xuất hiện một lần trong References.
+Cho phép tối đa 20 redirect nếu không lặp và URL cuối phải trả HTTP 2xx.
+Redirect loop hoặc trang con redirect về trang chủ cùng hostname (không tính www) bị bỏ; chuyển sang subdomain khác vẫn được theo dõi.
+too_many_redirects, redirect_loop và redirected_to_homepage không retry.
+Các lỗi retry 3 lần với delay 1/2/4 giây: access_restricted, shortener_not_redirect, missing_location, target_unavailable, request_error.
+HTTP 401/403 còn lại sau retry được giữ trong References với trạng thái access_restricted; các lỗi khác bị bỏ.
 Mỗi reference nằm trên một dòng. Bước resolve cần Internet; kết quả được ghi trong manifest.
+File merged_resolved_lookup.xlsx ghi URL gốc/chuẩn hóa/đích, số lần xuất hiện, trạng thái giữ/bỏ và lý do.
 """,
     "restore": """Ví dụ:
   .\\nctl.exe restore .\\task1.db
