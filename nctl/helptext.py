@@ -13,7 +13,9 @@ Ví dụ nhanh:
   .\\nctl.exe help setup
   .\\nctl.exe help restore
   .\\nctl.exe backup --all
-  .\\nctl.exe report --all --merge
+  .\\nctl.exe report --all
+  .\\nctl.exe mask .\\report.xlsx
+  .\\nctl.exe unmask .\\report_masked.xlsx
   .\\nctl.exe merge .\\existing-reports
   .\\nctl.exe restore .\\backup
 
@@ -35,7 +37,8 @@ Sao chép config.example.json thành config.json nếu chưa có. Ví dụ nội
     "password": "your-login-password",
     "verify_tls": false,
     "timeout": 60,
-    "default_db_password": "your-shared-db-password"
+    "default_db_password": "your-shared-db-password",
+    "mask_password": "your-strong-mask-password"
   }
 
 Mật khẩu đăng nhập và mật khẩu DB là HAI giá trị riêng biệt.
@@ -50,6 +53,7 @@ Biến môi trường PowerShell (ưu tiên CLI > môi trường > config):
   $env:NCTL_ACCESS_KEY = "your-access-key"
   $env:NCTL_SECRET_KEY = "your-secret-key"
   $env:NCTL_TIMEOUT = "60"
+  $env:NCTL_MASK_PASSWORD = "your-strong-mask-password"
 Có thể dùng cặp API key thay username/password nếu máy chủ hỗ trợ.
 
 Ví dụ:
@@ -100,8 +104,8 @@ Lỗi một history không dừng phần còn lại; exit code khác 0 nếu có
   .\\nctl.exe report --scans "12,15,20"
   .\\nctl.exe report --folder "Target Group 1"
   .\\nctl.exe report --folders "Target Group 1" "Target Group 2"
-  .\\nctl.exe report --folders 7,8,9 --merge
-  .\\nctl.exe report --all --merge --output D:\\ScanReports
+  .\\nctl.exe report --folders 7,8,9
+  .\\nctl.exe report --all --output D:\\ScanReports
   .\\nctl.exe report --all --include-trash
 
 Mỗi scan xuất kết quả mới nhất thành một file Excel riêng, bật toàn bộ cột API hỗ trợ.
@@ -120,8 +124,12 @@ Folder nhận ID hoặc tên, không phân biệt hoa thường; tên có dấu 
 Chọn rõ scan ID hoặc folder Trash vẫn xuất các scan đó.
 Output mặc định: data/reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
 Tên file: scan-12_Ten scan.xlsx; manifest.json ghi các file và lỗi.
-Từ 2 scan thực tế trở lên tự tạo merged.xlsx rồi merged_resolved.xlsx, bất kể đầu vào là list, folder, nhiều folder hay --all.
-Với đúng 1 scan, dùng --merge nếu vẫn muốn tạo file gộp. Các file lẻ luôn được giữ nguyên.
+Luôn tạo merged.xlsx rồi merged_resolved.xlsx, kể cả khi phạm vi thực tế chỉ có 1 scan.
+Các file lẻ luôn được giữ nguyên.
+Mặc định tạo thêm merged_resolved_masked.xlsx và mapping mã hóa merged_resolved.mask.enc.
+Nếu resolve URL lỗi, bản masked được tạo từ merged.xlsx.
+Bản masked thay Host/Location bằng token; vẫn giữ cột Plugin Output nhưng làm rỗng toàn bộ giá trị.
+Không gửi file .mask.enc hoặc mật khẩu mask cho AI.
 File gộp chỉ có một header ở dòng đầu; dữ liệu tất cả scan nối tiếp phía sau.
 Thứ tự đầu file gộp: Source, Group, Name, Risk, Host, Location, Description, Solution,
 Plugin Output, See Also, CVE, sau đó là các cột còn lại.
@@ -137,7 +145,7 @@ Dòng khác severity/score/plugin output hoặc bất kỳ cột nào ngoài CVE
 Dòng giống nhau ở các scan khác nhau vẫn được giữ theo Source tương ứng.
 In số dòng đã đọc, dòng trùng/gộp bị loại và dòng unique giữ lại cho từng scan và tổng.
 Các số đếm này cũng được lưu trong manifest.json; không tính header hoặc dòng trống.
-Chỉ lọc trùng khi --merge; các file Excel lẻ vẫn giữ nguyên dữ liệu gốc.
+Chỉ file gộp lọc trùng; các file Excel lẻ vẫn giữ nguyên dữ liệu gốc.
 Cột Source ở đầu file gộp ghi tên scan gốc cho từng dòng, giúp lọc khi IP trùng.
 Sau merged.xlsx, chương trình tạo merged_resolved.xlsx với cột References ngay sau See Also.
 Mọi URL HTTP/HTTPS trong See Also đều được resolve, không phụ thuộc giá trị Risk.
@@ -183,6 +191,34 @@ Các lỗi retry 3 lần với delay 1/2/4 giây: access_restricted, shortener_n
 HTTP 401/403 còn lại sau retry được giữ trong References với trạng thái access_restricted; các lỗi khác bị bỏ.
 Mỗi reference nằm trên một dòng. Bước resolve cần Internet; kết quả được ghi trong manifest.
 File merged_resolved_lookup.xlsx ghi URL gốc/chuẩn hóa/đích, số lần xuất hiện, trạng thái giữ/bỏ và lý do.
+""",
+    "mask": """Ví dụ:
+  .\\nctl.exe mask .\\report.xlsx
+  .\\nctl.exe mask .\\report.xlsx --output .\\for-ai.xlsx --map-output .\\for-ai.mask.enc
+
+Lệnh chạy offline, không cần đăng nhập máy chủ.
+Host và Location được thay bằng token ngẫu nhiên dễ đọc, có nhãn loại rõ ràng, ví dụ:
+[[HOST:7K3M-9QPD-2R5T-X6WC-4VBN-J8HF-Z2]].
+Cùng giá trị trong một lượt mask dùng cùng token; lượt mask khác sinh token mới.
+Cột Plugin Output vẫn tồn tại đúng vị trí nhưng mọi giá trị dữ liệu được làm rỗng.
+File input không bị sửa; mặc định tạo <name>_masked.xlsx và <name>.mask.enc.
+Mapping dùng AES-256-GCM và scrypt; không gửi mapping hoặc mật khẩu cho AI.
+Mật khẩu lấy từ NCTL_MASK_PASSWORD, mask_password trong config.json hoặc được hỏi tương tác.
+Với --non-interactive, phải cấu hình NCTL_MASK_PASSWORD hoặc mask_password.
+""",
+    "unmask": """Ví dụ:
+  .\\nctl.exe unmask .\\report_masked.xlsx
+  .\\nctl.exe unmask .\\ai-result.xlsx --map .\\report.mask.enc
+  .\\nctl.exe unmask .\\ai-result.xlsx --map .\\report.mask.enc --output .\\ai-result_unmasked.xlsx
+
+Lệnh chạy offline, không cần đăng nhập máy chủ.
+Unmask thay token Host/Location ở mọi cell của mọi sheet bằng giá trị thật trong mapping mã hóa.
+Không phụ thuộc tên sheet, header hoặc vị trí ô; token nằm xen giữa nội dung khác vẫn được thay.
+Việc sắp xếp lại hàng không ảnh hưởng nếu token vẫn còn nguyên.
+Plugin Output không được mapping và được giữ nguyên; có thể paste dữ liệu vào cột này trước hoặc sau unmask.
+File input không bị sửa; mặc định <name>_masked.xlsx tạo <name>_unmasked.xlsx.
+Nếu tên file không theo mẫu *_masked.xlsx, truyền --map rõ ràng.
+Sai mật khẩu hoặc mapping bị sửa sẽ bị từ chối.
 """,
     "restore": """Ví dụ:
   .\\nctl.exe restore .\\task1.db

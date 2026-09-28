@@ -18,3 +18,4 @@ reports/
 *.db
 .nctl-restore.json
 .nctl-restore-*.tmp
+*.mask.enc

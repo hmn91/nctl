@@ -866,6 +866,10 @@ class MergeTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_report_rejects_removed_merge_option(self):
+        with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(["report", "--all", "--merge"])
+
     def test_truncated_cell_is_logged_and_recorded_in_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             client = Mock(url="https://scanner.example")
@@ -876,11 +880,11 @@ class ReportTests(unittest.TestCase):
                 [["Name", "Risk", "Plugin Output"], ["Detection", "None", "x" * 40000]],
             )
             args = build_parser().parse_args([
-                "report", "--all", "--merge", "--output", directory,
+                "report", "--all", "--output", directory,
             ])
             output = io.StringIO()
             with patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
-                self.assertEqual(cmd_report(client, args, {}), 0)
+                self.assertEqual(cmd_report(client, args, {"mask_password": "test password"}), 0)
             root = next(Path(directory).iterdir())
             manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
             detail = manifest["files"][0]["truncated_details"][0]
@@ -896,9 +900,9 @@ class ReportTests(unittest.TestCase):
             self.assertIn("ô C2 (Plugin Output) dài 40000 ký tự", output.getvalue())
             self.assertIn("ô I2 (Plugin Output) dài 40000 ký tự", output.getvalue())
 
-    def test_separate_files_optional_merge_and_partial_export_failure(self):
-        for merge, fail in ((False, False), (True, False), (True, True)):
-            with self.subTest(merge=merge, fail=fail), tempfile.TemporaryDirectory() as directory:
+    def test_separate_files_always_merge_and_partial_export_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
                 client = Mock()
                 client.url = "https://scanner.example"
                 client.list_folders.return_value = []
@@ -917,11 +921,14 @@ class ReportTests(unittest.TestCase):
 
                 client.export_csv.side_effect = export
                 args = build_parser().parse_args([
-                    "report", "--all", "--output", directory, *(["--merge"] if merge else []),
+                    "report", "--all", "--output", directory,
                 ])
                 output = io.StringIO()
                 with patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
-                    self.assertEqual(cmd_report(client, args, {}), 2 if fail else 0)
+                    self.assertEqual(
+                        cmd_report(client, args, {"mask_password": "test password"}),
+                        2 if fail else 0,
+                    )
                 root = next(Path(directory).iterdir())
                 manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
                 self.assertEqual(len(manifest["files"]), 2 if fail else 3)
@@ -967,7 +974,7 @@ class ReportTests(unittest.TestCase):
                     "", "", "", "", "", "", "3", "data\nmore"],
                 ])
 
-    def test_two_resolved_scans_auto_merge_for_all_selector_types(self):
+    def test_two_resolved_scans_merge_for_all_selector_types(self):
         cases = [
             ["--scans", "1,2,1"],
             ["--folder", "Team A"],
@@ -997,14 +1004,15 @@ class ReportTests(unittest.TestCase):
                 ])
                 output = io.StringIO()
                 with patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
-                    self.assertEqual(cmd_report(client, args, {}), 0)
+                    self.assertEqual(cmd_report(
+                        client, args, {"mask_password": "test password"},
+                    ), 0)
                 root = next(Path(directory).iterdir())
                 self.assertTrue((root / "merged.xlsx").exists())
                 self.assertTrue((root / "merged_resolved.xlsx").exists())
                 self.assertTrue((root / "merged_resolved_lookup.xlsx").exists())
-                self.assertIn("Tự động bật merge", output.getvalue())
 
-    def test_one_scan_does_not_auto_merge_without_option(self):
+    def test_one_scan_always_merges(self):
         with tempfile.TemporaryDirectory() as directory:
             client = Mock(url="https://scanner.example")
             client.list_folders.return_value = []
@@ -1016,11 +1024,18 @@ class ReportTests(unittest.TestCase):
                 "report", "--scans", "1,1", "--output", directory,
             ])
             with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
-                self.assertEqual(cmd_report(client, args, {}), 0)
+                self.assertEqual(cmd_report(
+                    client, args, {"mask_password": "test password"},
+                ), 0)
             root = next(Path(directory).iterdir())
-            self.assertFalse((root / "merged.xlsx").exists())
-            self.assertFalse((root / "merged_resolved.xlsx").exists())
-            self.assertFalse((root / "merged_resolved_lookup.xlsx").exists())
+            self.assertTrue((root / "merged.xlsx").exists())
+            self.assertTrue((root / "merged_resolved.xlsx").exists())
+            self.assertTrue((root / "merged_resolved_lookup.xlsx").exists())
+            self.assertTrue((root / "merged_resolved_masked.xlsx").exists())
+            self.assertTrue((root / "merged_resolved.mask.enc").exists())
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["masked"]["file"], "merged_resolved_masked.xlsx")
+            self.assertEqual(manifest["masked"]["mapping_file"], "merged_resolved.mask.enc")
 
     def test_all_failed_exports_do_not_create_merged_excel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1028,9 +1043,11 @@ class ReportTests(unittest.TestCase):
             client.list_folders.return_value = []
             client.list_scans.return_value = {"scans": [{"id": 1}]}
             client.export_csv.side_effect = NctlError("no results")
-            args = build_parser().parse_args(["report", "--all", "--merge", "--output", directory])
+            args = build_parser().parse_args(["report", "--all", "--output", directory])
             with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
-                self.assertEqual(cmd_report(client, args, {}), 2)
+                self.assertEqual(cmd_report(
+                    client, args, {"mask_password": "test password"},
+                ), 2)
             self.assertFalse(list(Path(directory).rglob("*.xlsx")))
 
 

@@ -4,5 +4,6 @@
   "password": "admin",
   "verify_tls": false,
   "timeout": 60,
-  "default_db_password": "NctlDB@2026"
+  "default_db_password": "NctlDB@2026",
+  "mask_password": "change-this-mask-password"
 }

@@ -21,6 +21,7 @@ import xlsxwriter
 from xlsxwriter.exceptions import XlsxWriterException
 from xlsxwriter.utility import xl_rowcol_to_cell
 
+from . import __version__
 from .client import NctlError
 from .report_groups import group_for_finding
 
@@ -400,7 +401,7 @@ def _http_session() -> requests.Session:
     if session is None:
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "nctl-reference-resolver/2.6.1",
+            "User-Agent": f"nctl-reference-resolver/{__version__}",
             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         })
         _HTTP_LOCAL.session = session

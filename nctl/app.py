@@ -19,6 +19,14 @@ from . import __version__
 from .client import NctlClient, NctlError
 from .helptext import OVERVIEW, TOPICS
 from .report_excel import export_scan_xlsx, merge_scan_xlsx, resolve_references_xlsx
+from .report_mask import (
+    default_mapping_path,
+    default_masked_path,
+    default_unmasked_path,
+    inferred_mapping_path,
+    mask_workbook,
+    unmask_workbook,
+)
 
 
 DEFAULT_URL = "https://127.0.0.1:11127"
@@ -105,6 +113,26 @@ def _db_password(args: argparse.Namespace, config: dict[str, Any], action: str) 
         f"Mật khẩu dùng chung cho lượt {action} (Enter = mật khẩu mặc định): "
     )
     return entered or default
+
+
+def _mask_password(
+    args: argparse.Namespace, config: dict[str, Any], *, confirm: bool,
+) -> str:
+    configured = os.getenv("NCTL_MASK_PASSWORD") or config.get("mask_password")
+    if configured:
+        return str(configured)
+    if args.non_interactive:
+        raise NctlError(
+            "Thiếu NCTL_MASK_PASSWORD hoặc mask_password trong chế độ non-interactive."
+        )
+    password = getpass.getpass("Mật khẩu mask/unmask: ")
+    if not password:
+        raise NctlError("Mật khẩu mask/unmask không được để trống.")
+    if confirm:
+        repeated = getpass.getpass("Nhập lại mật khẩu mask: ")
+        if password != repeated:
+            raise NctlError("Mật khẩu mask nhập lại không khớp.")
+    return password
 
 
 def _folder_id(
@@ -423,14 +451,14 @@ def _merge_csv_files(
     return count
 
 
-def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) -> int:
+def cmd_report(client: NctlClient, args: argparse.Namespace, config: dict[str, Any]) -> int:
     if not (0 <= args.poll_interval < float("inf")) or not (0 < args.export_timeout < float("inf")):
         raise NctlError("--poll-interval phải >= 0 và --export-timeout phải > 0 (số hữu hạn).")
     selected = _report_scans(client, args)
     if not selected:
         print("Không có scan trong phạm vi đã chọn.")
         return 0
-    auto_merge = len(selected) >= 2
+    mask_password = _mask_password(args, config, confirm=True)
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     report_dir = Path(args.output).expanduser() / f"nctl-report-{stamp}"
     report_dir.mkdir(parents=True, exist_ok=False)
@@ -446,8 +474,6 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
     raw_exports: list[Path] = []
     scan_names: list[str] = []
     print(f"Xuất Excel đầy đủ cột cho {len(selected)} scan vào {report_dir}")
-    if auto_merge and not args.merge:
-        print("Tự động bật merge vì phạm vi thực tế có từ 2 scan trở lên.")
     for index, scan in enumerate(selected, 1):
         scan_id = int(scan["id"])
         destination = report_dir / f"scan-{scan_id}_{_safe_name(scan.get('name') or 'scan')}.xlsx"
@@ -489,7 +515,7 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                     "scan_id": scan_id, "stage": "cleanup", "error": str(exc),
                 })
         _write_manifest(manifest_path, manifest)
-    if args.merge or auto_merge:
+    if exported:
         try:
             merged = report_dir / "merged.xlsx"
             statistics: list[dict[str, Any]] = []
@@ -502,7 +528,6 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
             duplicates_removed = sum(item["duplicates_removed"] for item in statistics)
             manifest["merged"] = {
                 "file": merged.name, "rows": row_count, "scans": len(exported),
-                "automatic": auto_merge and not args.merge,
                 "input_rows": input_rows, "duplicates_removed": duplicates_removed,
                 "truncated_cells": merge_result["truncated_cells"],
                 "truncated_details": merge_result["truncated_details"],
@@ -528,6 +553,7 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                 )
             resolved = report_dir / "merged_resolved.xlsx"
             resolved_lookup = report_dir / "merged_resolved_lookup.xlsx"
+            mask_source = merged
             print(f"Resolve URL trong See Also và tạo {resolved.name}...")
             try:
                 resolved_result = resolve_references_xlsx(
@@ -548,6 +574,7 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                     file=sys.stderr,
                 )
             else:
+                mask_source = resolved
                 manifest["resolved"] = {
                     "file": resolved.name,
                     "lookup_file": resolved_lookup.name,
@@ -587,6 +614,28 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
                         f"({detail['column']}) dài {detail['original_length']} ký tự; "
                         f"đã giữ {detail['saved_length']} ký tự và highlight ô."
                     )
+            masked = default_masked_path(mask_source)
+            mapping = default_mapping_path(mask_source)
+            try:
+                mask_result = mask_workbook(
+                    mask_source,
+                    masked,
+                    mapping,
+                    mask_password,
+                )
+            except (NctlError, OSError) as exc:
+                manifest["errors"].append({
+                    "stage": "mask", "file": mask_source.name, "error": str(exc),
+                })
+                print(f"LỖI tạo bản masked từ {mask_source.name}: {exc}", file=sys.stderr)
+            else:
+                manifest["masked"] = mask_result
+                print(
+                    f"Đã tạo bản dành cho AI {masked}: che {mask_result['host_cells']} ô Host, "
+                    f"{mask_result['location_cells']} ô Location; làm rỗng "
+                    f"{mask_result['plugin_output_cells_cleared']} ô Plugin Output. "
+                    f"Mapping mã hóa: {mapping}."
+                )
         except (NctlError, OSError) as exc:
             manifest["errors"].append({"stage": "merge", "error": str(exc)})
             print(f"LỖI gộp Excel: {exc}", file=sys.stderr)
@@ -602,6 +651,55 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, _: dict[str, Any]) 
     errors = len(manifest["errors"])
     print(f"Hoàn tất: {len(exported)}/{len(selected)} Excel; {errors} lỗi. Chi tiết: {manifest_path}")
     return 2 if errors else 0
+
+
+def cmd_mask(
+    _: NctlClient | None, args: argparse.Namespace, config: dict[str, Any],
+) -> int:
+    source = Path(args.path).expanduser().resolve()
+    destination = (
+        Path(args.output).expanduser().resolve()
+        if args.output is not None else default_masked_path(source)
+    )
+    mapping = (
+        Path(args.map_output).expanduser().resolve()
+        if args.map_output is not None else default_mapping_path(source)
+    )
+    result = mask_workbook(
+        source, destination, mapping, _mask_password(args, config, confirm=True),
+    )
+    print(
+        f"Đã tạo {destination}: che {result['host_cells']} ô Host, "
+        f"{result['location_cells']} ô Location; giữ cột Plugin Output và làm rỗng "
+        f"{result['plugin_output_cells_cleared']} ô. Mapping mã hóa: {mapping}"
+    )
+    return 0
+
+
+def cmd_unmask(
+    _: NctlClient | None, args: argparse.Namespace, config: dict[str, Any],
+) -> int:
+    source = Path(args.path).expanduser().resolve()
+    destination = (
+        Path(args.output).expanduser().resolve()
+        if args.output is not None else default_unmasked_path(source)
+    )
+    mapping = (
+        Path(args.map).expanduser().resolve()
+        if args.map is not None else inferred_mapping_path(source)
+    )
+    result = unmask_workbook(
+        source, destination, mapping, _mask_password(args, config, confirm=False),
+    )
+    changed_note = "" if result["source_matches_original_masked"] else (
+        " File masked đã được chỉnh sửa; chỉ các token còn nguyên mới được unmask."
+    )
+    print(
+        f"Đã tạo {destination}: unmask {result['host_tokens']} token Host và "
+        f"{result['location_tokens']} token Location. Plugin Output được giữ nguyên."
+        f"{changed_note}"
+    )
+    return 0
 
 
 def cmd_merge_files(
@@ -1624,7 +1722,7 @@ class NctlArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = NctlArgumentParser(
         prog="nctl",
-        description="Backup, restore, xuất report Excel, tạo và theo dõi scan trên máy chủ quét.",
+        description="Backup/restore, xuất và mask report Excel, tạo và theo dõi scan trên máy chủ quét.",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--config", type=Path, default=Path("config.json"), help="JSON config (mặc định: config.json)")
@@ -1640,7 +1738,7 @@ def build_parser() -> argparse.ArgumentParser:
     help_command = sub.add_parser("help", help="Hướng dẫn offline kèm ví dụ sử dụng")
     help_command.add_argument(
         "topic", nargs="*", metavar="TOPIC",
-        help="setup, status, folders, scans, backup, report, merge, restore, delete, task [create|launch], monitor",
+        help="setup, status, folders, scans, backup, report, merge, mask, unmask, restore, delete, task [create|launch], monitor",
     )
     help_command.epilog = "Ví dụ: nctl help; nctl help setup; nctl help task create"
 
@@ -1687,10 +1785,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", default=DEFAULT_REPORT_OUTPUT,
         help=f"Thư mục chứa lượt report (mặc định: {DEFAULT_REPORT_OUTPUT})",
     )
-    report.add_argument(
-        "--merge", action="store_true",
-        help="Gộp thêm merged.xlsx khi chỉ chọn 1 scan; từ 2 scan trở lên tự động merge",
-    )
     report.add_argument("--poll-interval", type=float, default=1.0, help="Chu kỳ kiểm tra export (giây)")
     report.add_argument("--export-timeout", type=float, default=1800, help="Timeout mỗi export (giây)")
     report.set_defaults(handler=cmd_report)
@@ -1700,6 +1794,27 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--folder", dest="folder_option", type=Path, help="Thư mục chứa file CSV/XLSX")
     merge.add_argument("--output", type=Path, help="File Excel đầu ra (mặc định: <folder>/merged.xlsx)")
     merge.set_defaults(handler=cmd_merge_files, offline=True)
+
+    mask = sub.add_parser("mask", help="Che Host/Location và làm rỗng Plugin Output trong Excel")
+    mask.add_argument("path", type=Path, help="File .xlsx cần mask")
+    mask.add_argument("--output", type=Path, help="File masked đầu ra (mặc định: <name>_masked.xlsx)")
+    mask.add_argument(
+        "--map-output", type=Path,
+        help="Mapping mã hóa đầu ra (mặc định: <name>.mask.enc)",
+    )
+    mask.set_defaults(handler=cmd_mask, offline=True, load_config=True)
+
+    unmask = sub.add_parser("unmask", help="Khôi phục token Host/Location trong Excel masked")
+    unmask.add_argument("path", type=Path, help="File .xlsx đã mask hoặc đã được AI xử lý")
+    unmask.add_argument(
+        "--map", type=Path,
+        help="Mapping mã hóa (mặc định suy ra từ tên file *_masked.xlsx)",
+    )
+    unmask.add_argument(
+        "--output", type=Path,
+        help="File unmasked đầu ra (mặc định: <name>_unmasked.xlsx)",
+    )
+    unmask.set_defaults(handler=cmd_unmask, offline=True, load_config=True)
 
     restore = sub.add_parser("restore", help="Restore hàng loạt file .db")
     restore.add_argument("paths", nargs="+", help="File .db hoặc thư mục (tìm đệ quy)")
@@ -1793,9 +1908,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     client: NctlClient | None = None
     try:
+        config: dict[str, Any] = {}
+        if not getattr(args, "offline", False) or getattr(args, "load_config", False):
+            config = _load_config(args.config)
         if getattr(args, "offline", False):
-            return int(args.handler(None, args, {}))
-        config = _load_config(args.config)
+            return int(args.handler(None, args, config))
         client = _make_client(args, config)
         return int(args.handler(client, args, config))
     except KeyboardInterrupt:

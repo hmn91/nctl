@@ -1,10 +1,10 @@
 # nctl
 
-`nctl` là CLI quản lý máy chủ quét: xem folder/scan, xuất report Excel, backup và restore database,
+`nctl` là CLI quản lý máy chủ quét: xem folder/scan, xuất và mask report Excel, backup/restore database,
 tạo hoặc chạy task, theo dõi tiến độ và xóa scan. Bản Windows portable chạy độc lập; mã nguồn yêu cầu
 Python 3.10 trở lên.
 
-Phiên bản hiện tại: **2.6.1**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
+Phiên bản hiện tại: **2.7.0**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## Bắt đầu nhanh
 
@@ -42,6 +42,7 @@ $env:NCTL_DB_PASSWORD = "your-db-password"
 $env:NCTL_ACCESS_KEY = "your-access-key"
 $env:NCTL_SECRET_KEY = "your-secret-key"
 $env:NCTL_TIMEOUT = "60"
+$env:NCTL_MASK_PASSWORD = "your-strong-mask-password"
 ```
 
 Mặc định chương trình dùng `https://127.0.0.1:11127` và không kiểm tra TLS để hỗ trợ chứng chỉ tự ký.
@@ -56,6 +57,8 @@ Dùng `--verify-tls` khi máy đã tin cậy CA. Có thể dùng access key/secr
 | `scans` | Liệt kê scan, có thể lọc theo folder |
 | `report` | Xuất report Excel từ một hoặc nhiều scan/folder |
 | `merge` | Gộp các file CSV/XLSX có sẵn và tạo report chuẩn hóa |
+| `mask` | Tạo bản Excel che Host/Location và làm rỗng Plugin Output |
+| `unmask` | Khôi phục token Host/Location bằng mapping mã hóa |
 | `backup` | Tải database `.db` theo scan/history |
 | `restore` | Import lại database, có checkpoint để resume |
 | `delete` | Chuyển scan vào Trash hoặc xóa vĩnh viễn |
@@ -69,6 +72,8 @@ Hướng dẫn đầy đủ luôn có trong chương trình:
 .\nctl.exe --help
 .\nctl.exe help report
 .\nctl.exe help merge
+.\nctl.exe help mask
+.\nctl.exe help unmask
 .\nctl.exe help backup
 .\nctl.exe help restore
 .\nctl.exe help delete
@@ -101,8 +106,7 @@ Thư mục `data/`, `config.json`, `.venv/`, `build/`, `dist/` và `release/` kh
 `--scan` và `--scans` nhận scan ID. `--folder` và `--folders` nhận folder ID hoặc tên, không phân biệt
 hoa thường. Scan/folder trùng chỉ được xử lý một lần. `--all` bỏ qua Trash trừ khi có `--include-trash`.
 
-Từ hai scan thực tế trở lên, chương trình tự động merge bất kể kiểu selector. Với đúng một scan, thêm
-`--merge` nếu vẫn muốn tạo file gộp.
+Chương trình luôn tạo file gộp, kể cả khi phạm vi thực tế chỉ có một scan.
 
 ### File đầu ra
 
@@ -112,6 +116,8 @@ Từ hai scan thực tế trở lên, chương trình tự động merge bất k
 | `merged.xlsx` | Dữ liệu chuẩn hóa và gộp từ các scan thành công |
 | `merged_resolved.xlsx` | Bản gộp có thêm cột `References` sau `See Also` |
 | `merged_resolved_lookup.xlsx` | Chi tiết URL nguồn, URL đích, status, số lần thử và lý do giữ/bỏ |
+| `merged_resolved_masked.xlsx` | Bản dành cho AI: token hóa Host/Location, giữ cột Plugin Output nhưng làm rỗng dữ liệu |
+| `merged_resolved.mask.enc` | Mapping Host/Location đã mã hóa để dùng với `unmask`; không gửi cho AI |
 | `manifest.json` | Metadata, lỗi, thống kê dòng, group, URL và cell bị rút gọn |
 
 Một scan export lỗi không dừng các scan còn lại. Khi có lỗi, exit code là 2 và `merged.xlsx` chỉ chứa
@@ -172,6 +178,32 @@ Sau khi tạo `merged.xlsx`, chương trình resolve **mọi URL HTTP/HTTPS** tr
 Các lỗi `access_restricted`, `shortener_not_redirect`, `missing_location`, `target_unavailable` và
 `request_error` được retry tối đa ba lần sau lần đầu, chờ lần lượt 1, 2 và 4 giây.
 
+### Mask dữ liệu dành cho AI
+
+`report` mặc định tạo `merged_resolved_masked.xlsx`. Nếu bước resolve URL lỗi, chương trình vẫn tạo
+`merged_masked.xlsx` từ `merged.xlsx`. Bản report đầy đủ luôn được giữ riêng.
+
+- `Host` và `Location` được thay bằng token ngẫu nhiên khoảng 130-bit nhưng vẫn dễ đọc và nhận biết loại,
+  ví dụ `[[HOST:7K3M-9QPD-2R5T-X6WC-4VBN-J8HF-Z2]]`. Cùng một giá trị trong một lượt mask dùng cùng token;
+  lượt mask khác sinh token mới để tránh liên kết dữ liệu giữa các file.
+- Cột `Plugin Output` vẫn được giữ đúng vị trí nhưng toàn bộ giá trị được làm rỗng.
+- Mapping token được mã hóa AES-256-GCM trong file `.mask.enc`; không gửi file này hoặc mật khẩu cho AI.
+- `unmask` tìm token đã map trong mọi ô của mọi sheet, kể cả token nằm xen giữa nội dung khác; không phụ thuộc
+  tên sheet, header hoặc vị trí ô. Nội dung `Plugin Output` trong file AI được giữ nguyên để có thể paste dữ liệu
+  vào trước hoặc sau khi unmask.
+
+Có thể mask/unmask độc lập, không cần kết nối máy chủ:
+
+```powershell
+.\nctl.exe mask .\report.xlsx
+.\nctl.exe unmask .\report_masked.xlsx
+.\nctl.exe unmask .\ai-result.xlsx --map .\report.mask.enc --output .\ai-result_unmasked.xlsx
+```
+
+Mặc định `mask` tạo `report_masked.xlsx` và `report.mask.enc`; `unmask` tạo
+`report_unmasked.xlsx`. Mật khẩu lấy từ `NCTL_MASK_PASSWORD`, `mask_password` trong `config.json`, hoặc được
+hỏi tương tác. Chế độ `--non-interactive` bắt buộc cấu hình một trong hai nguồn này.
+
 ## Merge report có sẵn
 
 ```powershell
@@ -182,7 +214,7 @@ Các lỗi `access_restricted`, `shortener_not_redirect`, `missing_location`, `t
 
 Lệnh đọc file `.csv` và `.xlsx` ở cấp đầu tiên của thư mục, dùng worksheet đầu tiên của XLSX. File output
 hiện tại được loại khỏi input khi chạy lại. Cột `Source`, `Group`, `Location` và `Description` có sẵn được giữ;
-ô hoặc cột thiếu được bổ sung theo cùng logic của `report --merge`. Nếu thiếu `Source`, tên file được dùng.
+ô hoặc cột thiếu được bổ sung theo cùng logic merge của `report`. Nếu thiếu `Source`, tên file được dùng.
 
 Bước đọc và gộp file không cần kết nối máy chủ; bước tạo file resolved cần Internet để kiểm tra URL.
 
@@ -221,8 +253,8 @@ nhập. Nên backup trước khi xóa vĩnh viễn. Credential cho task có th�
 .\dist\nctl.exe --version
 ```
 
-Dependencies runtime được khai báo trong `pyproject.toml` và `requirements.txt`: `requests` và
-`XlsxWriter`. Cấu trúc chính:
+Dependencies runtime được khai báo trong `pyproject.toml` và `requirements.txt`: `requests`,
+`XlsxWriter` và `cryptography`. Cấu trúc chính:
 
 - `nctl/`: CLI, API client, xử lý report và help tích hợp.
 - `tests/`: unit/integration tests không yêu cầu máy chủ thật.
