@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -24,6 +25,16 @@ from .client import NctlError
 
 _SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _XML_NS = "http://www.w3.org/XML/1998/namespace"
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_CANONICAL_PREFIXES = {
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships": "r",
+    _MC_NS: "mc",
+    "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac": "x14ac",
+    "http://schemas.microsoft.com/office/spreadsheetml/2014/revision": "xr",
+    "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2": "xr2",
+    "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3": "xr3",
+}
+_CANONICAL_URIS = {prefix: uri for uri, prefix in _CANONICAL_PREFIXES.items()}
 _MASK_COLUMNS = {"host": "Host", "location": "Location"}
 _PLUGIN_OUTPUT = "plugin output"
 _AAD = b"nctl-mask-map-v1"
@@ -36,6 +47,47 @@ _READABLE_TOKEN_PATTERN = re.compile(
 )
 
 ET.register_namespace("", _SHEET_NS)
+
+
+def _namespace_map(data: bytes) -> dict[str, str]:
+    namespaces: dict[str, str] = {}
+    try:
+        for _, item in ET.iterparse(io.BytesIO(data), events=("start-ns",)):
+            prefix, uri = item
+            namespaces.setdefault(prefix or "", uri)
+    except ET.ParseError as exc:
+        raise NctlError(f"Namespace XML trong worksheet không hợp lệ: {exc}") from exc
+    return namespaces
+
+
+def _prepare_worksheet_xml(root: ET.Element, namespaces: dict[str, str]) -> bytes:
+    serialized_prefixes: dict[str, str] = {}
+    for prefix, uri in namespaces.items():
+        output_prefix = _CANONICAL_PREFIXES.get(uri, prefix)
+        if output_prefix and not re.fullmatch(r"ns\d+", output_prefix):
+            ET.register_namespace(output_prefix, uri)
+            serialized_prefixes[uri] = output_prefix
+
+    used_uris: set[str] = set()
+    for element in root.iter():
+        for qualified_name in (element.tag, *element.attrib):
+            if isinstance(qualified_name, str) and qualified_name.startswith("{"):
+                used_uris.add(qualified_name[1:].split("}", 1)[0])
+
+    ignorable_key = f"{{{_MC_NS}}}Ignorable"
+    ignorable = root.attrib.get(ignorable_key, "").split()
+    if ignorable:
+        retained: list[str] = []
+        for prefix in ignorable:
+            uri = namespaces.get(prefix) or _CANONICAL_URIS.get(prefix)
+            output_prefix = serialized_prefixes.get(uri or "")
+            if uri in used_uris and output_prefix and output_prefix not in retained:
+                retained.append(output_prefix)
+        if retained:
+            root.set(ignorable_key, " ".join(retained))
+        else:
+            root.attrib.pop(ignorable_key, None)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def default_masked_path(source: Path) -> Path:
@@ -132,6 +184,13 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> str:
 def _set_cell_value(cell: ET.Element, value: str) -> None:
     for child in list(cell):
         cell.remove(child)
+    if value == "":
+        # Keep the cell node (and therefore its style) but store no value at all.
+        # In particular, do not leave an empty shared-string reference such as
+        # t="s"><v>15</v>, because simplistic XLSX readers can misread 15 as the
+        # cell value instead of resolving sharedStrings.xml entry 15 to "".
+        cell.attrib.pop("t", None)
+        return
     cell.set("t", "inlineStr")
     inline = ET.SubElement(cell, f"{{{_SHEET_NS}}}is")
     text = ET.SubElement(inline, f"{{{_SHEET_NS}}}t")
@@ -187,29 +246,35 @@ def _rewrite_xlsx(
             sheet_entries = _worksheet_entries(input_archive.namelist())
             if not sheet_entries:
                 raise NctlError(f"Excel {source} không có worksheet.")
-            transformed_roots: dict[str, ET.Element] = {}
+            transformed_roots: dict[str, tuple[ET.Element, dict[str, str]]] = {}
             for sheet_entry in sheet_entries:
+                sheet_data = input_archive.read(sheet_entry)
+                namespaces = _namespace_map(sheet_data)
                 try:
-                    root = ET.fromstring(input_archive.read(sheet_entry))
+                    root = ET.fromstring(sheet_data)
                 except ET.ParseError as exc:
                     raise NctlError(
                         f"Worksheet {sheet_entry} không hợp lệ: {exc}"
                     ) from exc
                 transform_sheet(sheet_entry, root, shared)
-                transformed_roots[sheet_entry] = root
-            # A shared string can also be referenced by a non-sensitive cell (even a
-            # header). Convert those remaining references to inline strings before
-            # scrubbing the sensitive shared-string slots from the XLSX package.
-            for root in transformed_roots.values():
+                transformed_roots[sheet_entry] = (root, namespaces)
+            # Normalize empty shared strings to truly blank cells. A shared string can
+            # also be referenced by a non-sensitive cell (even a header), so convert
+            # references to scrubbed slots to inline strings before scrubbing them.
+            for root, _ in transformed_roots.values():
                 for cell in root.findall(f".//{{{_SHEET_NS}}}c"):
                     shared_index = _cell_shared_index(cell)
-                    if shared_index is not None and shared_index in (scrub_shared_indices or set()):
-                        if not 0 <= shared_index < len(shared):
-                            raise NctlError("Excel tham chiếu shared string không hợp lệ.")
+                    if shared_index is None:
+                        continue
+                    if not 0 <= shared_index < len(shared):
+                        raise NctlError("Excel tham chiếu shared string không hợp lệ.")
+                    if shared[shared_index] == "":
+                        _set_cell_value(cell, "")
+                    elif shared_index in (scrub_shared_indices or set()):
                         _set_cell_value(cell, shared[shared_index])
             transformed_sheets = {
-                name: ET.tostring(root, encoding="utf-8", xml_declaration=True)
-                for name, root in transformed_roots.items()
+                name: _prepare_worksheet_xml(root, namespaces)
+                for name, (root, namespaces) in transformed_roots.items()
             }
             with zipfile.ZipFile(destination, "w") as output_archive:
                 for item in input_archive.infolist():

@@ -1,5 +1,17 @@
 # Release notes
 
+## nctl 2.7.1 — 2026-09-29
+
+### Sửa lỗi unmask workbook do Microsoft Excel lưu
+
+- Giữ lại prefix namespace chuẩn của Excel (`mc`, `x14ac`, `xr`, `xr2`, `xr3`) khi ghi lại worksheet.
+- Đồng bộ `mc:Ignorable` với các namespace thực sự còn được sử dụng, tránh cảnh báo “We found a problem with
+  some content” khi mở file `_unmasked.xlsx`.
+- Chuẩn hóa mọi chuỗi rỗng thành cell rỗng thực sự khi mask/unmask; không còn `t="s"`/`<v>15</v>` trỏ tới
+  một mục rỗng trong `sharedStrings.xml` khiến một số bộ đọc XLSX của AI hiểu nhầm giá trị là `15`.
+- Thêm regression test mô phỏng đúng workbook có compatibility/revision namespaces của Microsoft Excel.
+- 104 tests passed trên Python 3.10.
+
 ## nctl 2.7.0 — 2026-09-28
 
 ### Mask/unmask report dành cho AI

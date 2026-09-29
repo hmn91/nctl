@@ -27,6 +27,76 @@ def write_workbook(path, sheets):
                     )
 
 
+def add_excel_compatibility_namespaces(path):
+    temporary = path.with_suffix(".namespaces.xlsx")
+    marker = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    replacement = (
+        marker
+        + ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        + ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+        + ' mc:Ignorable="x14ac xr xr2 xr3"'
+        + ' xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"'
+        + ' xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision"'
+        + ' xmlns:xr2="http://schemas.microsoft.com/office/spreadsheetml/2015/revision2"'
+        + ' xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3"'
+        + ' xr:uid="{00000000-0001-0000-0000-000000000000}"'
+    )
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(temporary, "w") as destination:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                xml = data.decode("utf-8")
+                if marker not in xml:
+                    raise AssertionError("Không tìm thấy worksheet root để tạo fixture namespace")
+                xml = xml.replace(marker, replacement, 1)
+                xml = xml.replace(
+                    "<sheetFormatPr ", '<sheetFormatPr x14ac:dyDescent="0.25" ', 1,
+                )
+                data = xml.encode("utf-8")
+            destination.writestr(item, data)
+    temporary.replace(path)
+
+
+def replace_cell_with_empty_shared_string(path, cell_reference, shared_index=15):
+    temporary = path.with_suffix(".shared-empty.xlsx")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(temporary, "w") as destination:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename == "xl/sharedStrings.xml":
+                root = ET.fromstring(data)
+                items = root.findall("x:si", _NS)
+                while len(items) <= shared_index:
+                    value = "" if len(items) == shared_index else f"padding-{len(items)}"
+                    item_node = ET.SubElement(root, f"{{{_NS['x']}}}si")
+                    text_node = ET.SubElement(item_node, f"{{{_NS['x']}}}t")
+                    text_node.text = value
+                    items.append(item_node)
+                root.set("uniqueCount", str(len(items)))
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            elif item.filename == "xl/worksheets/sheet1.xml":
+                root = ET.fromstring(data)
+                cell = root.find(f".//x:c[@r='{cell_reference}']", _NS)
+                if cell is None:
+                    raise AssertionError(f"Không tìm thấy cell {cell_reference} trong fixture")
+                for child in list(cell):
+                    cell.remove(child)
+                cell.set("t", "s")
+                value_node = ET.SubElement(cell, f"{{{_NS['x']}}}v")
+                value_node.text = str(shared_index)
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            destination.writestr(item, data)
+    temporary.replace(path)
+
+
+def cell_xml(path, cell_reference, sheet_number=1):
+    with zipfile.ZipFile(path) as archive:
+        root = ET.fromstring(archive.read(f"xl/worksheets/sheet{sheet_number}.xml"))
+    cell = root.find(f".//x:c[@r='{cell_reference}']", _NS)
+    if cell is None:
+        raise AssertionError(f"Không tìm thấy cell {cell_reference}")
+    return cell
+
+
 def read_sheet(path, sheet_number=1):
     with zipfile.ZipFile(path) as archive:
         shared = []
@@ -111,6 +181,29 @@ class MaskingTests(unittest.TestCase):
             self.assertEqual(result["host_tokens"], 3)
             self.assertEqual(result["location_tokens"], 3)
             self.assertTrue(result["source_matches_original_masked"])
+
+    def test_mask_writes_empty_cells_without_shared_string_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "report.xlsx"
+            masked = root / "report_masked.xlsx"
+            mapping = root / "report.mask.enc"
+            write_workbook(source, [
+                ("Report", [
+                    ["Host", "Location", "Plugin Output", "Notes"],
+                    ["server.example", "tcp/443", "evidence", "placeholder"],
+                ]),
+            ])
+            replace_cell_with_empty_shared_string(source, "D2", shared_index=15)
+
+            mask_workbook(source, masked, mapping, "strong password")
+
+            self.assertEqual(read_sheet(masked)[1][2:], ["", ""])
+            for reference in ("C2", "D2"):
+                cell = cell_xml(masked, reference)
+                self.assertNotIn("t", cell.attrib)
+                self.assertIsNone(cell.find("x:v", _NS))
+                self.assertIsNone(cell.find("x:is", _NS))
 
     def test_unmask_rejects_wrong_password_without_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -211,6 +304,33 @@ class MaskingTests(unittest.TestCase):
             self.assertEqual(result["host_tokens"], 3)
             self.assertEqual(result["location_tokens"], 2)
             self.assertEqual(result["cells"], 3)
+
+    def test_unmask_preserves_excel_compatibility_namespaces(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "report.xlsx"
+            masked = root / "report_masked.xlsx"
+            mapping = root / "report.mask.enc"
+            unmasked = root / "report_unmasked.xlsx"
+            write_workbook(source, [
+                ("Report", [
+                    ["Host", "Location", "Plugin Output"],
+                    ["server.example", "tcp/443", "evidence"],
+                ]),
+            ])
+            mask_workbook(source, masked, mapping, "strong password")
+            add_excel_compatibility_namespaces(masked)
+
+            unmask_workbook(masked, unmasked, mapping, "strong password")
+
+            self.assertEqual(read_sheet(unmasked)[1], ["server.example", "tcp/443", ""])
+            with zipfile.ZipFile(unmasked) as archive:
+                worksheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            self.assertIn('xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"', worksheet)
+            self.assertIn('xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"', worksheet)
+            self.assertIn('xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision"', worksheet)
+            self.assertIn('mc:Ignorable="x14ac xr"', worksheet)
+            self.assertNotIn("xr2 xr3", worksheet)
 
     def test_unmask_handles_ai_reordered_content_and_preserves_pasted_plugin_output(self):
         with tempfile.TemporaryDirectory() as directory:

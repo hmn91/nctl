@@ -4,7 +4,7 @@
 tạo hoặc chạy task, theo dõi tiến độ và xóa scan. Bản Windows portable chạy độc lập; mã nguồn yêu cầu
 Python 3.10 trở lên.
 
-Phiên bản hiện tại: **2.7.0**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
+Phiên bản hiện tại: **2.7.1**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## Bắt đầu nhanh
 
