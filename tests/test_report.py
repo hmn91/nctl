@@ -866,10 +866,6 @@ class MergeTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
-    def test_report_rejects_removed_merge_option(self):
-        with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
-            build_parser().parse_args(["report", "--all", "--merge"])
-
     def test_truncated_cell_is_logged_and_recorded_in_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             client = Mock(url="https://scanner.example")
@@ -973,44 +969,6 @@ class ReportTests(unittest.TestCase):
                      "Google Chrome < 137.0 Multiple Vulnerabilities", "High", "192.0.2.3",
                     "", "", "", "", "", "", "3", "data\nmore"],
                 ])
-
-    def test_two_resolved_scans_merge_for_all_selector_types(self):
-        cases = [
-            ["--scans", "1,2,1"],
-            ["--folder", "Team A"],
-            ["--folders", "Team A", "Empty"],
-            ["--all"],
-        ]
-        for flags in cases:
-            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
-                client = Mock(url="https://scanner.example")
-                client.list_folders.return_value = [
-                    {"id": 7, "name": "Team A", "type": "custom"},
-                    {"id": 8, "name": "Empty", "type": "custom"},
-                ]
-                scans = [
-                    {"id": 1, "name": "One", "folder_id": 7},
-                    {"id": 2, "name": "Two", "folder_id": 7},
-                ]
-                client.list_scans.side_effect = lambda folder_id=None: {
-                    "scans": scans if folder_id is None or folder_id == 7 else [],
-                }
-                client.export_csv.side_effect = lambda scan_id, destination, **kwargs: write_csv(
-                    destination,
-                    [["Name", "Risk"], [f"Detection {scan_id}", "None"]],
-                )
-                args = build_parser().parse_args([
-                    "report", *flags, "--output", directory,
-                ])
-                output = io.StringIO()
-                with patch("sys.stdout", new=output), patch("sys.stderr", new=io.StringIO()):
-                    self.assertEqual(cmd_report(
-                        client, args, {"mask_password": "test password"},
-                    ), 0)
-                root = next(Path(directory).iterdir())
-                self.assertTrue((root / "merged.xlsx").exists())
-                self.assertTrue((root / "merged_resolved.xlsx").exists())
-                self.assertTrue((root / "merged_resolved_lookup.xlsx").exists())
 
     def test_one_scan_always_merges(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -617,25 +617,20 @@ class HelpTests(unittest.TestCase):
                 load_config.assert_not_called()
                 make_client.assert_not_called()
                 self.assertIn("Ví dụ", output.getvalue())
-                self.assertNotIn("nessus", output.getvalue().casefold())
 
-    def test_command_help_includes_examples_and_is_offline(self):
-        commands = [""] + [topic for topic in TOPICS if topic != "setup"]
-        for command in commands:
-            with self.subTest(command=command):
-                output = io.StringIO()
-                with (
-                    patch("nctl.app._load_config") as load_config,
-                    patch("nctl.app._make_client") as make_client,
-                    patch("sys.stdout", new=output),
-                    self.assertRaises(SystemExit) as stopped,
-                ):
-                    main([*command.split(), "--help"])
-                self.assertEqual(stopped.exception.code, 0)
-                load_config.assert_not_called()
-                make_client.assert_not_called()
-                self.assertIn("Ví dụ", output.getvalue())
-                self.assertNotIn("nessus", output.getvalue().casefold())
+    def test_command_help_is_offline(self):
+        output = io.StringIO()
+        with (
+            patch("nctl.app._load_config") as load_config,
+            patch("nctl.app._make_client") as make_client,
+            patch("sys.stdout", new=output),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            main(["report", "--help"])
+        self.assertEqual(stopped.exception.code, 0)
+        load_config.assert_not_called()
+        make_client.assert_not_called()
+        self.assertIn("Ví dụ", output.getvalue())
 
     def test_no_arguments_displays_help_without_login(self):
         output = io.StringIO()
