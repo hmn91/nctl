@@ -4,7 +4,7 @@
 tạo hoặc chạy task, theo dõi tiến độ và xóa scan. Bản Windows portable chạy độc lập; mã nguồn yêu cầu
 Python 3.10 trở lên.
 
-Phiên bản hiện tại: **2.7.1**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
+Phiên bản hiện tại: **2.7.2**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## Bắt đầu nhanh
 
@@ -201,8 +201,11 @@ Có thể mask/unmask độc lập, không cần kết nối máy chủ:
 ```
 
 Mặc định `mask` tạo `report_masked.xlsx` và `report.mask.enc`; `unmask` tạo
-`report_unmasked.xlsx`. Mật khẩu lấy từ `NCTL_MASK_PASSWORD`, `mask_password` trong `config.json`, hoặc được
-hỏi tương tác. Chế độ `--non-interactive` bắt buộc cấu hình một trong hai nguồn này.
+`report_unmasked.xlsx`. Khi không truyền `--map`, `unmask` tự tìm file `.enc` trong cùng thư mục input: tự dùng
+nếu chỉ có một file, hoặc hiển thị danh sách để chọn số/nhập path nếu có nhiều file. Trong chế độ
+`--non-interactive`, nhiều file `.enc` yêu cầu truyền `--map` rõ ràng. Mật khẩu lấy từ `NCTL_MASK_PASSWORD`,
+`mask_password` trong `config.json`, hoặc được hỏi tương tác; chế độ `--non-interactive` bắt buộc cấu hình một
+trong hai nguồn này.
 
 ## Merge report có sẵn
 

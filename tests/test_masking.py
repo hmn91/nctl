@@ -1,7 +1,9 @@
+import io
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -375,9 +377,108 @@ class MaskingTests(unittest.TestCase):
             with patch.dict("os.environ", {"NCTL_MASK_PASSWORD": "environment password"}):
                 self.assertEqual(main([*common, "mask", str(source)]), 0)
                 masked = root / "input_masked.xlsx"
-                self.assertEqual(main([*common, "unmask", str(masked)]), 0)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main([*common, "unmask", str(masked)]), 0)
             self.assertTrue((root / "input.mask.enc").exists())
             self.assertTrue((root / "input_unmasked.xlsx").exists())
+            self.assertIn(
+                f"Phát hiện và sẽ sử dụng file mapping .enc: {(root / 'input.mask.enc').resolve()}",
+                output.getvalue(),
+            )
+
+    def test_unmask_cli_prompts_to_select_one_of_multiple_mappings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input.xlsx"
+            masked = root / "input_masked.xlsx"
+            first_mapping = root / "a.enc"
+            second_mapping = root / "b.enc"
+            missing_config = root / "missing-config.json"
+            write_workbook(source, [
+                ("Report", [["Host", "Location"], ["host", "tcp/22"]]),
+            ])
+            mask_workbook(source, masked, second_mapping, "environment password")
+            first_mapping.write_bytes(second_mapping.read_bytes())
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", {"NCTL_MASK_PASSWORD": "environment password"}),
+                patch("builtins.input", return_value="2") as prompt,
+                redirect_stdout(output),
+            ):
+                result = main(["--config", str(missing_config), "unmask", str(masked)])
+
+            self.assertEqual(result, 0)
+            prompt.assert_called_once()
+            self.assertIn("Phát hiện 2 file mapping .enc", output.getvalue())
+            self.assertIn(f"  1. {first_mapping.resolve()}", output.getvalue())
+            self.assertIn(f"  2. {second_mapping.resolve()}", output.getvalue())
+            self.assertIn(
+                f"Sẽ sử dụng file mapping .enc: {second_mapping.resolve()}",
+                output.getvalue(),
+            )
+            self.assertTrue((root / "input_unmasked.xlsx").exists())
+
+    def test_unmask_cli_accepts_typed_mapping_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input.xlsx"
+            masked = root / "input_masked.xlsx"
+            external = root / "external" / "chosen.enc"
+            missing_config = root / "missing-config.json"
+            write_workbook(source, [
+                ("Report", [["Host", "Location"], ["host", "tcp/22"]]),
+            ])
+            external.parent.mkdir()
+            mask_workbook(source, masked, external, "environment password")
+            (root / "a.enc").write_bytes(external.read_bytes())
+            (root / "b.enc").write_bytes(external.read_bytes())
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", {"NCTL_MASK_PASSWORD": "environment password"}),
+                patch("builtins.input", return_value=str(external)),
+                redirect_stdout(output),
+            ):
+                result = main(["--config", str(missing_config), "unmask", str(masked)])
+
+            self.assertEqual(result, 0)
+            self.assertIn(
+                f"Sẽ sử dụng file mapping .enc: {external.resolve()}",
+                output.getvalue(),
+            )
+            self.assertTrue((root / "input_unmasked.xlsx").exists())
+
+    def test_unmask_cli_requires_map_for_multiple_candidates_when_non_interactive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input.xlsx"
+            masked = root / "input_masked.xlsx"
+            mapping = root / "a.enc"
+            missing_config = root / "missing-config.json"
+            write_workbook(source, [
+                ("Report", [["Host", "Location"], ["host", "tcp/22"]]),
+            ])
+            mask_workbook(source, masked, mapping, "environment password")
+            (root / "b.enc").write_bytes(mapping.read_bytes())
+
+            output = io.StringIO()
+            errors = io.StringIO()
+            with (
+                patch.dict("os.environ", {"NCTL_MASK_PASSWORD": "environment password"}),
+                redirect_stdout(output),
+                redirect_stderr(errors),
+            ):
+                result = main([
+                    "--config", str(missing_config), "--non-interactive",
+                    "unmask", str(masked),
+                ])
+
+            self.assertEqual(result, 2)
+            self.assertIn("Phát hiện 2 file mapping .enc", output.getvalue())
+            self.assertIn("hãy truyền --map <mapping.enc>", errors.getvalue())
+            self.assertFalse((root / "input_unmasked.xlsx").exists())
 
 
 if __name__ == "__main__":

@@ -217,7 +217,9 @@ Không phụ thuộc tên sheet, header hoặc vị trí ô; token nằm xen gi�
 Việc sắp xếp lại hàng không ảnh hưởng nếu token vẫn còn nguyên.
 Plugin Output không được mapping và được giữ nguyên; có thể paste dữ liệu vào cột này trước hoặc sau unmask.
 File input không bị sửa; mặc định <name>_masked.xlsx tạo <name>_unmasked.xlsx.
-Nếu tên file không theo mẫu *_masked.xlsx, truyền --map rõ ràng.
+Nếu không truyền --map, tool tìm file .enc trong cùng thư mục với file input.
+Nếu chỉ có một file .enc, tool thông báo và tự sử dụng; nếu có nhiều file, tool hiển thị danh sách để chọn số
+hoặc nhập path. Chế độ --non-interactive có nhiều file .enc yêu cầu truyền --map rõ ràng.
 Sai mật khẩu hoặc mapping bị sửa sẽ bị từ chối.
 """,
     "restore": """Ví dụ:

@@ -105,13 +105,6 @@ def default_unmasked_path(source: Path) -> Path:
     return source.with_name(f"{stem}_unmasked.xlsx")
 
 
-def inferred_mapping_path(masked: Path) -> Path:
-    stem = masked.stem
-    if stem.casefold().endswith("_masked"):
-        stem = stem[:-len("_masked")]
-    return masked.with_name(f"{stem}.mask.enc")
-
-
 def _validate_source(path: Path) -> None:
     if not path.is_file() or path.suffix.casefold() != ".xlsx":
         raise NctlError(f"Không phải file .xlsx hợp lệ: {path}")

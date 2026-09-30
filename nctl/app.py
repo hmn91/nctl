@@ -23,7 +23,6 @@ from .report_mask import (
     default_mapping_path,
     default_masked_path,
     default_unmasked_path,
-    inferred_mapping_path,
     mask_workbook,
     unmask_workbook,
 )
@@ -676,18 +675,73 @@ def cmd_mask(
     return 0
 
 
+def _select_unmask_mapping(source: Path, args: argparse.Namespace) -> Path:
+    if args.map is not None:
+        return Path(args.map).expanduser().resolve()
+
+    candidates = sorted(
+        (
+            path.resolve()
+            for path in source.parent.iterdir()
+            if path.is_file() and path.suffix.casefold() == ".enc"
+        ),
+        key=lambda path: (path.name.casefold(), str(path).casefold()),
+    )
+    if not candidates:
+        raise NctlError(
+            f"Không tìm thấy file mapping .enc trong thư mục {source.parent}. "
+            "Hãy truyền --map <mapping.enc>."
+        )
+    if len(candidates) == 1:
+        print(f"Phát hiện và sẽ sử dụng file mapping .enc: {candidates[0]}")
+        return candidates[0]
+
+    print(f"Phát hiện {len(candidates)} file mapping .enc trong {source.parent}:")
+    for index, candidate in enumerate(candidates, start=1):
+        print(f"  {index}. {candidate}")
+    if args.non_interactive:
+        raise NctlError(
+            "Có nhiều file mapping .enc trong chế độ non-interactive; "
+            "hãy truyền --map <mapping.enc>."
+        )
+
+    while True:
+        answer = input(
+            f"Chọn file mapping [1-{len(candidates)}] hoặc nhập path: "
+        ).strip()
+        if answer.isdigit():
+            selected_index = int(answer)
+            if 1 <= selected_index <= len(candidates):
+                selected = candidates[selected_index - 1]
+                print(f"Sẽ sử dụng file mapping .enc: {selected}")
+                return selected
+            print(
+                f"Lựa chọn phải từ 1 đến {len(candidates)}.",
+                file=sys.stderr,
+            )
+            continue
+
+        selected = Path(answer).expanduser().resolve() if answer else None
+        if selected is not None and selected.is_file() and selected.suffix.casefold() == ".enc":
+            print(f"Sẽ sử dụng file mapping .enc: {selected}")
+            return selected
+        print(
+            "Path mapping không hợp lệ; hãy chọn số trong danh sách hoặc nhập file .enc tồn tại.",
+            file=sys.stderr,
+        )
+
+
 def cmd_unmask(
     _: NctlClient | None, args: argparse.Namespace, config: dict[str, Any],
 ) -> int:
     source = Path(args.path).expanduser().resolve()
+    if not source.is_file() or source.suffix.casefold() != ".xlsx":
+        raise NctlError(f"Không phải file .xlsx hợp lệ: {source}")
     destination = (
         Path(args.output).expanduser().resolve()
         if args.output is not None else default_unmasked_path(source)
     )
-    mapping = (
-        Path(args.map).expanduser().resolve()
-        if args.map is not None else inferred_mapping_path(source)
-    )
+    mapping = _select_unmask_mapping(source, args)
     result = unmask_workbook(
         source, destination, mapping, _mask_password(args, config, confirm=False),
     )
@@ -1808,7 +1862,7 @@ def build_parser() -> argparse.ArgumentParser:
     unmask.add_argument("path", type=Path, help="File .xlsx đã mask hoặc đã được AI xử lý")
     unmask.add_argument(
         "--map", type=Path,
-        help="Mapping mã hóa (mặc định suy ra từ tên file *_masked.xlsx)",
+        help="Mapping mã hóa (nếu bỏ qua: tự tìm file .enc cùng thư mục input)",
     )
     unmask.add_argument(
         "--output", type=Path,

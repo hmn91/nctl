@@ -1,5 +1,17 @@
 # Release notes
 
+## nctl 2.7.2 — 2026-09-30
+
+### Tự động phát hiện mapping khi unmask
+
+- Khi không truyền `--map`, `unmask` tìm mọi file `.enc` trong cùng thư mục với file Excel đầu vào.
+- Nếu chỉ có một file `.enc`, tool thông báo và tự sử dụng; nếu có nhiều file, tool hiển thị danh sách đánh số để
+  chọn hoặc cho phép nhập trực tiếp path mapping.
+- Trong chế độ `--non-interactive`, một file `.enc` vẫn được tự chọn; nhiều file yêu cầu truyền `--map` rõ ràng
+  để tránh dùng nhầm mapping.
+- Cập nhật help/README và bổ sung regression tests cho tự chọn, chọn theo số, nhập path và chế độ non-interactive.
+- 107 tests passed trên Python 3.10.
+
 ## nctl 2.7.1 — 2026-09-29
 
 ### Sửa lỗi unmask workbook do Microsoft Excel lưu
