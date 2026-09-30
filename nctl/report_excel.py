@@ -32,6 +32,27 @@ MERGED_FIRST_COLUMNS = (
     "Source", "Group", "Name", "Risk", "Host", "Location", "Description",
     "Solution", "Plugin Output", "See Also", "CVE",
 )
+COMPACT_EXCLUDED_COLUMNS = (
+    "Plugin ID",
+    "CVSS v2.0 Base Score",
+    "STIG Severity",
+    "CVSS v4.0 Base Score",
+    "CVSS v4.0 Base+Threat Score",
+    "CVSS v3.0 Base Score",
+    "CVSS v2.0 Temporal Score",
+    "CVSS v3.0 Temporal Score",
+    "VPR Score",
+    "EPSS Score",
+    "Risk Factor",
+    "BID",
+    "XREF",
+    "MSKB",
+    "Plugin Publication Date",
+    "Plugin Modification Date",
+    "Metasploit",
+    "Core Impact",
+    "CANVAS",
+)
 _MERGED_CONSUMED = {
     "source", "group", "name", "risk", "host", "protocol", "port",
     "location", "synopsis", "description", "solution", "plugin output",
@@ -336,6 +357,58 @@ def _write_workbook(
     }
 
 
+def create_compact_xlsx(
+    source: Path,
+    destination: Path,
+    *,
+    existing_truncations: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Copy a merged workbook while omitting configured columns when present."""
+    source = Path(source)
+    destination = Path(destination)
+    if source.resolve() == destination.resolve():
+        raise NctlError("File compact phải khác file merged nguồn.")
+    first_pass = iter(_xlsx_rows(source))
+    header = next((row for row in first_pass if any(row)), [])
+    if not header:
+        raise NctlError(f"Excel {source} không có header hợp lệ.")
+    excluded = {name.casefold() for name in COMPACT_EXCLUDED_COLUMNS}
+    kept_indices = [
+        index for index, name in enumerate(header)
+        if name.strip().casefold() not in excluded
+    ]
+    removed_columns = [
+        name for index, name in enumerate(header) if index not in kept_indices
+    ]
+    columns = [header[index] for index in kept_indices]
+
+    def rows() -> Iterator[list[str]]:
+        table_rows = iter(_xlsx_rows(source))
+        current_header = next((row for row in table_rows if any(row)), [])
+        if current_header != header:
+            raise NctlError(f"Header Excel {source} đã thay đổi trong lúc tạo bản compact.")
+        for row_number, row in enumerate(table_rows, 2):
+            if not any(row) or row == header:
+                continue
+            row = _fit_row(row, header, source, row_number)
+            yield [row[index] for index in kept_indices]
+
+    result = _write_workbook(
+        destination,
+        columns,
+        rows(),
+        existing_truncations=existing_truncations,
+    )
+    return {
+        **result,
+        "file": destination.name,
+        "source_file": source.name,
+        "removed_columns": removed_columns,
+        "removed_column_count": len(removed_columns),
+        "kept_column_count": len(columns),
+    }
+
+
 def _is_nessus_shortener(url: str) -> bool:
     try:
         parsed = urlsplit(url)
@@ -550,7 +623,7 @@ def resolve_references_xlsx(
     resolver: Callable[[str], dict[str, Any]] | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Create a second merged workbook with validated final URLs in References."""
+    """Create a resolved workbook with References and without the source See Also column."""
     if workers < 1:
         raise NctlError("Số worker resolve URL phải lớn hơn 0.")
     first_pass = iter(_xlsx_rows(source))
@@ -603,13 +676,13 @@ def resolve_references_xlsx(
     source_references_index = next(
         (index for index, name in enumerate(header) if name.casefold() == "references"), None
     )
-    columns = [name for name in header if name.casefold() != "references"]
-    output_see_also_index = next(
-        (index for index, name in enumerate(columns) if name.casefold() == "see also"), None
-    )
-    references_index = (
-        output_see_also_index + 1 if output_see_also_index is not None
-        else next((i for i, name in enumerate(columns) if name.casefold() == "cve"), len(columns))
+    columns = [
+        name for name in header
+        if name.casefold() not in {"references", "see also"}
+    ]
+    references_index = next(
+        (index for index, name in enumerate(columns) if name.casefold() == "cve"),
+        len(columns),
     )
     columns.insert(references_index, "References")
 
@@ -640,10 +713,16 @@ def resolve_references_xlsx(
                         and result.get("target_url")
                     ):
                         add_link(str(result["target_url"]))
-            if source_references_index is not None:
-                del row[source_references_index]
-            row.insert(references_index, "\n".join(links.values()))
-            yield row
+            excluded_indices = {
+                index for index in (source_references_index, see_also_index)
+                if index is not None
+            }
+            output_row = [
+                value for index, value in enumerate(row)
+                if index not in excluded_indices
+            ]
+            output_row.insert(references_index, "\n".join(links.values()))
+            yield output_row
 
     workbook_result = _write_workbook(
         destination, columns, rows(), existing_truncations=existing_truncations,
@@ -708,6 +787,7 @@ def resolve_references_xlsx(
         "lookup_rows": lookup_result["rows"],
         "lookup_truncated_cells": lookup_result["truncated_cells"],
         "lookup_truncated_details": lookup_result["truncated_details"],
+        "see_also_removed": see_also_index is not None,
     }
 
 

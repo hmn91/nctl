@@ -124,10 +124,10 @@ Folder nhận ID hoặc tên, không phân biệt hoa thường; tên có dấu 
 Chọn rõ scan ID hoặc folder Trash vẫn xuất các scan đó.
 Output mặc định: data/reports/nctl-report-YYYYMMDD-HHMMSS-microseconds/.
 Tên file: scan-12_Ten scan.xlsx; manifest.json ghi các file và lỗi.
-Luôn tạo merged.xlsx rồi merged_resolved.xlsx, kể cả khi phạm vi thực tế chỉ có 1 scan.
+Luôn tạo merged.xlsx, merged_compact.xlsx rồi merged_resolved.xlsx, kể cả khi phạm vi chỉ có 1 scan.
 Các file lẻ luôn được giữ nguyên.
 Mặc định tạo thêm merged_resolved_masked.xlsx và mapping mã hóa merged_resolved.mask.enc.
-Nếu resolve URL lỗi, bản masked được tạo từ merged.xlsx.
+Nếu resolve URL lỗi, bản masked được tạo từ merged_compact.xlsx.
 Bản masked thay Host/Location bằng token; vẫn giữ cột Plugin Output nhưng làm rỗng toàn bộ giá trị.
 Không gửi file .mask.enc hoặc mật khẩu mask cho AI.
 File gộp chỉ có một header ở dòng đầu; dữ liệu tất cả scan nối tiếp phía sau.
@@ -147,7 +147,8 @@ In số dòng đã đọc, dòng trùng/gộp bị loại và dòng unique giữ
 Các số đếm này cũng được lưu trong manifest.json; không tính header hoặc dòng trống.
 Chỉ file gộp lọc trùng; các file Excel lẻ vẫn giữ nguyên dữ liệu gốc.
 Cột Source ở đầu file gộp ghi tên scan gốc cho từng dòng, giúp lọc khi IP trùng.
-Sau merged.xlsx, chương trình tạo merged_resolved.xlsx với cột References ngay sau See Also.
+Sau merged.xlsx, chương trình tạo merged_compact.xlsx bằng cách bỏ các cột metadata không cần thiết.
+Từ bản compact, chương trình tạo merged_resolved.xlsx, bỏ See Also và chỉ giữ References.
 Mọi URL HTTP/HTTPS trong See Also đều được resolve, không phụ thuộc giá trị Risk.
 URL rút gọn dạng /u?... được chuẩn hóa qua Tenable; URL đích trùng chỉ xuất hiện một lần trong References.
 Cho phép tối đa 20 redirect nếu không lặp và URL cuối phải trả HTTP 2xx.
@@ -177,11 +178,12 @@ Nếu một dòng đã có Source hoặc Group thì giữ giá trị đó; ô tr
 Source thiếu dùng tên file không có phần mở rộng. Group thiếu được phân loại theo cùng quy tắc report.
 Nếu file đã có Location/Description tổng hợp thì giữ nguyên; nếu còn Protocol/Port hoặc Synopsis/Description
 thì tạo Location và Description theo cùng quy tắc merged.xlsx của report.
-Đầu ra mặc định là <folder>/merged.xlsx, <folder>/merged_resolved.xlsx,
-<folder>/merged_resolved_lookup.xlsx và <folder>/merged.manifest.json.
+Đầu ra mặc định là <folder>/merged.xlsx, <folder>/merged_compact.xlsx,
+<folder>/merged_resolved.xlsx, <folder>/merged_resolved_lookup.xlsx và <folder>/merged.manifest.json.
 File gộp áp dụng unique/CVE, thứ tự cột, highlight ô bị rút gọn, header, freeze và Filter như report.
 Synopsis, Description và Solution cũng được bỏ xuống dòng do wrap web; Plugin Output giữ nguyên.
-Sau khi tạo merged.xlsx, lệnh tạo merged_resolved.xlsx với cột References ngay sau See Also.
+Sau merged.xlsx, lệnh tạo merged_compact.xlsx bằng cách bỏ các cột metadata không cần thiết.
+Từ bản compact, lệnh tạo merged_resolved.xlsx, bỏ See Also và chỉ giữ References.
 Mọi URL HTTP/HTTPS trong See Also đều được resolve, không phụ thuộc giá trị Risk.
 URL rút gọn dạng /u?... được chuẩn hóa qua Tenable; URL đích trùng chỉ xuất hiện một lần trong References.
 Cho phép tối đa 20 redirect nếu không lặp và URL cuối phải trả HTTP 2xx.

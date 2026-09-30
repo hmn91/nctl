@@ -4,7 +4,7 @@
 tạo hoặc chạy task, theo dõi tiến độ và xóa scan. Bản Windows portable chạy độc lập; mã nguồn yêu cầu
 Python 3.10 trở lên.
 
-Phiên bản hiện tại: **2.7.2**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
+Phiên bản hiện tại: **2.8.0**. Thay đổi chi tiết xem tại [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## Bắt đầu nhanh
 
@@ -114,7 +114,8 @@ Chương trình luôn tạo file gộp, kể cả khi phạm vi thực tế ch�
 | --- | --- |
 | `scan-<id>_<name>.xlsx` | Một file cho mỗi scan; giữ cột gốc và thêm `Group` ở cuối |
 | `merged.xlsx` | Dữ liệu chuẩn hóa và gộp từ các scan thành công |
-| `merged_resolved.xlsx` | Bản gộp có thêm cột `References` sau `See Also` |
+| `merged_compact.xlsx` | Bản gộp đã bỏ các cột metadata không cần cho bước xử lý tiếp theo |
+| `merged_resolved.xlsx` | Bản compact đã resolve URL vào `References` và bỏ cột `See Also` |
 | `merged_resolved_lookup.xlsx` | Chi tiết URL nguồn, URL đích, status, số lần thử và lý do giữ/bỏ |
 | `merged_resolved_masked.xlsx` | Bản dành cho AI: token hóa Host/Location, giữ cột Plugin Output nhưng làm rỗng dữ liệu |
 | `merged_resolved.mask.enc` | Mapping Host/Location đã mã hóa để dùng với `unmask`; không gửi cho AI |
@@ -140,6 +141,12 @@ Các cột đầu được sắp theo thứ tự:
 - Header in đậm, freeze top row và bật Filter; mọi cell căn trên và tắt Wrap Text.
 - Cell vượt 32.767 ký tự được rút gọn, highlight, log ra terminal và ghi vị trí vào manifest.
 
+Sau bước gộp, `merged_compact.xlsx` được tạo bằng cách bỏ các cột sau nếu chúng tồn tại:
+`Plugin ID`, `CVSS v2.0 Base Score`, `STIG Severity`, `CVSS v4.0 Base Score`,
+`CVSS v4.0 Base+Threat Score`, `CVSS v3.0 Base Score`, `CVSS v2.0 Temporal Score`,
+`CVSS v3.0 Temporal Score`, `VPR Score`, `EPSS Score`, `Risk Factor`, `BID`, `XREF`, `MSKB`,
+`Plugin Publication Date`, `Plugin Modification Date`, `Metasploit`, `Core Impact` và `CANVAS`.
+
 ### Phân nhóm lỗ hổng
 
 `Group` mô tả nguyên nhân hoặc thành phần, không chứa host hay tên scan. Ví dụ:
@@ -156,8 +163,8 @@ phiên bản trong `Plugin Output`; không giới hạn vào danh sách package 
 
 ### Resolve References
 
-Sau khi tạo `merged.xlsx`, chương trình resolve **mọi URL HTTP/HTTPS** trong `See Also`, kể cả dòng có
-`Risk = None`:
+Sau khi tạo `merged_compact.xlsx`, chương trình resolve **mọi URL HTTP/HTTPS** trong `See Also`, kể cả
+dòng có `Risk = None`. File `merged_resolved.xlsx` bỏ `See Also` và chỉ giữ kết quả trong `References`:
 
 1. URL rút gọn dạng `nessus.org/u?...` được chuẩn hóa qua endpoint Tenable.
 2. URL trực tiếp được kiểm tra ngay; mỗi URL nguồn chuẩn hóa chỉ resolve một lần.
@@ -181,7 +188,7 @@ Các lỗi `access_restricted`, `shortener_not_redirect`, `missing_location`, `t
 ### Mask dữ liệu dành cho AI
 
 `report` mặc định tạo `merged_resolved_masked.xlsx`. Nếu bước resolve URL lỗi, chương trình vẫn tạo
-`merged_masked.xlsx` từ `merged.xlsx`. Bản report đầy đủ luôn được giữ riêng.
+`merged_compact_masked.xlsx` từ `merged_compact.xlsx`. Bản report đầy đủ luôn được giữ riêng.
 
 - `Host` và `Location` được thay bằng token ngẫu nhiên khoảng 130-bit nhưng vẫn dễ đọc và nhận biết loại,
   ví dụ `[[HOST:7K3M-9QPD-2R5T-X6WC-4VBN-J8HF-Z2]]`. Cùng một giá trị trong một lượt mask dùng cùng token;

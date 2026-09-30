@@ -18,7 +18,12 @@ from typing import Any, Sequence
 from . import __version__
 from .client import NctlClient, NctlError
 from .helptext import OVERVIEW, TOPICS
-from .report_excel import export_scan_xlsx, merge_scan_xlsx, resolve_references_xlsx
+from .report_excel import (
+    create_compact_xlsx,
+    export_scan_xlsx,
+    merge_scan_xlsx,
+    resolve_references_xlsx,
+)
 from .report_mask import (
     default_mapping_path,
     default_masked_path,
@@ -550,13 +555,32 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, config: dict[str, A
                     f"({detail['column']}) dài {detail['original_length']} ký tự; "
                     f"đã giữ {detail['saved_length']} ký tự và highlight ô."
                 )
+            compact = report_dir / "merged_compact.xlsx"
+            try:
+                compact_result = create_compact_xlsx(
+                    merged,
+                    compact,
+                    existing_truncations=merge_result["truncated_details"],
+                )
+            except (NctlError, OSError) as exc:
+                raise NctlError(
+                    f"Đã tạo {merged.name}, nhưng không tạo được {compact.name}: {exc}"
+                ) from exc
+            else:
+                compact_source = compact
+                manifest["compact"] = compact_result
+                removed = compact_result["removed_columns"]
+                detail = ", ".join(removed) if removed else "không có cột thừa trong file nguồn"
+                print(
+                    f"Đã tạo {compact}: bỏ {compact_result['removed_column_count']} cột ({detail})."
+                )
             resolved = report_dir / "merged_resolved.xlsx"
             resolved_lookup = report_dir / "merged_resolved_lookup.xlsx"
-            mask_source = merged
+            mask_source = compact_source
             print(f"Resolve URL trong See Also và tạo {resolved.name}...")
             try:
                 resolved_result = resolve_references_xlsx(
-                    merged,
+                    compact_source,
                     resolved,
                     lookup_destination=resolved_lookup,
                     existing_truncations=merge_result["truncated_details"],
@@ -579,8 +603,8 @@ def cmd_report(client: NctlClient, args: argparse.Namespace, config: dict[str, A
                     "lookup_file": resolved_lookup.name,
                     "lookup_rows": resolved_result["lookup_rows"],
                     "rows": resolved_result["rows"],
-                    "source_file": merged.name,
-                    "references_column_after": "See Also",
+                    "source_file": compact_source.name,
+                    "see_also_removed": resolved_result["see_also_removed"],
                     "urls_found": resolved_result["urls_found"],
                     "unique_urls": resolved_result["unique_urls"],
                     "resolved_urls": resolved_result["resolved_urls"],
@@ -775,12 +799,13 @@ def cmd_merge_files(
         destination = destination.with_suffix(".xlsx")
     elif destination.suffix.casefold() != ".xlsx":
         raise NctlError("File output của lệnh merge phải có đuôi .xlsx.")
+    compact_destination = destination.with_name(f"{destination.stem}_compact.xlsx")
     resolved_destination = destination.with_name(f"{destination.stem}_resolved.xlsx")
     resolved_lookup_destination = destination.with_name(
         f"{destination.stem}_resolved_lookup.xlsx"
     )
     excluded_outputs = {
-        destination.resolve(), resolved_destination.resolve(),
+        destination.resolve(), compact_destination.resolve(), resolved_destination.resolve(),
         resolved_lookup_destination.resolve(),
     }
     candidates = sorted(
@@ -817,6 +842,22 @@ def cmd_merge_files(
         "truncated_details": result["truncated_details"],
         "group_by": "all_columns_except_cve", "cve_separator": "; ",
     }
+    try:
+        compact_result = create_compact_xlsx(
+            destination,
+            compact_destination,
+            existing_truncations=result["truncated_details"],
+        )
+    except (NctlError, OSError) as exc:
+        manifest["compact_error"] = str(exc)
+        _write_manifest(manifest_path, manifest)
+        raise NctlError(
+            f"Đã tạo {destination}, nhưng không tạo được {compact_destination}: {exc}"
+        ) from exc
+    manifest["compact"] = {
+        **compact_result,
+        "output": str(compact_destination),
+    }
     _write_manifest(manifest_path, manifest)
     for item in statistics:
         print(
@@ -833,10 +874,15 @@ def cmd_merge_files(
         f"Hoàn tất: đọc {input_rows} dòng; loại {duplicates_removed} dòng trùng; "
         f"ghi {result['rows']} dòng vào {destination}."
     )
+    removed = compact_result["removed_columns"]
+    detail = ", ".join(removed) if removed else "không có cột thừa trong file nguồn"
+    print(
+        f"Đã tạo {compact_destination}: bỏ {compact_result['removed_column_count']} cột ({detail})."
+    )
     print(f"Resolve URL trong See Also và tạo {resolved_destination.name}...")
     try:
         resolved_result = resolve_references_xlsx(
-            destination,
+            compact_destination,
             resolved_destination,
             lookup_destination=resolved_lookup_destination,
             existing_truncations=result["truncated_details"],
@@ -855,8 +901,8 @@ def cmd_merge_files(
         "lookup_output": str(resolved_lookup_destination),
         "lookup_rows": resolved_result["lookup_rows"],
         "rows": resolved_result["rows"],
-        "source_file": destination.name,
-        "references_column_after": "See Also",
+        "source_file": compact_destination.name,
+        "see_also_removed": resolved_result["see_also_removed"],
         "urls_found": resolved_result["urls_found"],
         "unique_urls": resolved_result["unique_urls"],
         "resolved_urls": resolved_result["resolved_urls"],

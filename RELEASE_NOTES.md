@@ -1,5 +1,23 @@
 # Release notes
 
+## nctl 2.8.0 — 2026-09-30
+
+### Compact report trước khi resolve và mask
+
+- Sau `merged.xlsx`, tự động tạo `merged_compact.xlsx` và loại 19 cột metadata không cần thiết nếu có.
+- Bước resolve và mask luôn dùng bản compact; nếu resolve lỗi, bản masked được tạo trực tiếp từ
+  `merged_compact.xlsx`.
+- Áp dụng cùng quy trình cho cả lệnh `report` và `merge` offline; output compact được tự loại khỏi danh sách
+  input khi chạy lại merge trong cùng thư mục.
+- Manifest ghi file nguồn, danh sách và số cột đã loại, số cột còn lại và số dòng của bản compact.
+
+### Chỉ giữ References trong bản resolved
+
+- `merged_resolved.xlsx` không còn cột `See Also`; các URL hợp lệ sau xử lý chỉ nằm trong `References`.
+- Nếu file nguồn đã có `References`, giá trị hiện có vẫn được giữ và gộp với URL resolve thành công mà không lặp.
+- Cập nhật README, help CLI và regression tests cho toàn bộ pipeline mới.
+- 106 tests passed trên Python 3.10.
+
 ## nctl 2.7.2 — 2026-09-30
 
 ### Tự động phát hiện mapping khi unmask

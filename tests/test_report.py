@@ -14,7 +14,9 @@ import xlsxwriter
 from nctl.app import _merge_csv_files, _report_scans, build_parser, cmd_report, main
 from nctl.client import CSV_COLUMNS, NctlClient, NctlError
 from nctl.report_excel import (
+    COMPACT_EXCLUDED_COLUMNS,
     _extract_reference_urls,
+    create_compact_xlsx,
     export_scan_xlsx,
     merge_scan_xlsx,
     reflow_narrative,
@@ -241,6 +243,26 @@ class GroupTests(unittest.TestCase):
 
 
 class ExcelReportTests(unittest.TestCase):
+    def test_compact_workbook_removes_only_configured_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "merged.xlsx"
+            compact = root / "merged_compact.xlsx"
+            header = ["Source", *COMPACT_EXCLUDED_COLUMNS, "Name", "Custom"]
+            row = ["Scan A", *[f"drop-{index}" for index in range(19)], "Finding", "keep"]
+            write_xlsx(source, [header, row])
+
+            result = create_compact_xlsx(source, compact)
+
+            self.assertEqual(read_xlsx(compact), [
+                ["Source", "Name", "Custom"],
+                ["Scan A", "Finding", "keep"],
+            ])
+            self.assertEqual(result["removed_columns"], list(COMPACT_EXCLUDED_COLUMNS))
+            self.assertEqual(result["removed_column_count"], 19)
+            self.assertEqual(result["kept_column_count"], 3)
+            self.assertEqual(read_xlsx(source), [header, row])
+
     def test_extract_reference_urls_keeps_balanced_url_parentheses(self):
         self.assertEqual(_extract_reference_urls(
             "See (https://wiki.example/Manual:Ciphers(1)). Also https://vendor.example/a]. "
@@ -470,7 +492,7 @@ class ExcelReportTests(unittest.TestCase):
                 self.assertEqual(result["attempt_statuses"], [expected_status] * 2)
                 sleeper.assert_called_once_with(1.0)
 
-    def test_resolved_workbook_places_references_immediately_after_see_also(self):
+    def test_resolved_workbook_replaces_see_also_with_references(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, destination = root / "merged.xlsx", root / "merged_resolved.xlsx"
@@ -529,21 +551,17 @@ class ExcelReportTests(unittest.TestCase):
                 progress=lambda completed, total: progress.append((completed, total)),
             )
             self.assertEqual(read_xlsx(destination), [[
-                "Source", "Name", "Risk", "See Also", "References", "CVE", "Extra",
+                "Source", "Name", "Risk", "References", "CVE", "Extra",
             ], [
                 "Scan A", "Finding", "High",
-                "http://www.nessus.org/u?good\nhttps://nessus.org/u?dead\n"
-                "https://nessus.org/u?restricted\n"
-                "https://vendor.example/direct\nhttps://vendor.example/missing",
                 "https://existing.example/reference\nhttps://vendor.example/advisory\n"
                 "https://protected.example/advisory",
                 "CVE-1", "kept",
             ], [
-                "Scan B", "Finding 2", "Medium", "https://nessus.org/u?good",
-                "https://vendor.example/advisory", "", "also kept",
+                "Scan B", "Finding 2", "Medium", "https://vendor.example/advisory",
+                "", "also kept",
             ], [
                 "Scan C", "Informational finding", "None",
-                "https://nessus.org/u?good\nhttps://nessus.org/u?none",
                 "https://vendor.example/advisory\nhttps://vendor.example/informational",
                 "", "not resolved",
             ]])
@@ -557,6 +575,7 @@ class ExcelReportTests(unittest.TestCase):
             self.assertEqual(result["resolved_urls"], 4)
             self.assertEqual(result["access_restricted_urls"], 1)
             self.assertEqual(result["rejected_urls"], 2)
+            self.assertTrue(result["see_also_removed"])
             self.assertEqual(result["status_counts"], {
                 "access_restricted": 1, "resolved": 3, "target_unavailable": 2,
             })
@@ -931,9 +950,13 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(len(manifest["errors"]), int(fail))
                 self.assertEqual(client.export_csv.call_count, 3)
                 self.assertTrue((root / "merged.xlsx").exists())
+                self.assertTrue((root / "merged_compact.xlsx").exists())
                 self.assertTrue((root / "merged_resolved.xlsx").exists())
                 self.assertTrue((root / "merged_resolved_lookup.xlsx").exists())
-                self.assertEqual(manifest["resolved"]["references_column_after"], "See Also")
+                self.assertEqual(manifest["compact"]["file"], "merged_compact.xlsx")
+                self.assertEqual(manifest["compact"]["removed_columns"], [])
+                self.assertEqual(manifest["resolved"]["source_file"], "merged_compact.xlsx")
+                self.assertTrue(manifest["resolved"]["see_also_removed"])
                 self.assertEqual(manifest["resolved"]["lookup_file"],
                                  "merged_resolved_lookup.xlsx")
                 for item in manifest["files"]:
@@ -987,11 +1010,16 @@ class ReportTests(unittest.TestCase):
                 ), 0)
             root = next(Path(directory).iterdir())
             self.assertTrue((root / "merged.xlsx").exists())
+            self.assertTrue((root / "merged_compact.xlsx").exists())
             self.assertTrue((root / "merged_resolved.xlsx").exists())
             self.assertTrue((root / "merged_resolved_lookup.xlsx").exists())
             self.assertTrue((root / "merged_resolved_masked.xlsx").exists())
             self.assertTrue((root / "merged_resolved.mask.enc").exists())
             manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["compact"]["file"], "merged_compact.xlsx")
+            self.assertEqual(manifest["compact"]["removed_columns"], [])
+            self.assertEqual(manifest["resolved"]["source_file"], "merged_compact.xlsx")
+            self.assertTrue(manifest["resolved"]["see_also_removed"])
             self.assertEqual(manifest["masked"]["file"], "merged_resolved_masked.xlsx")
             self.assertEqual(manifest["masked"]["mapping_file"], "merged_resolved.mask.enc")
 
@@ -1056,10 +1084,12 @@ class OfflineMergeTests(unittest.TestCase):
                 self.assertEqual(main(["merge", str(root)]), 0)
                 load_config.assert_not_called()
             merged = root / "merged.xlsx"
+            compact = root / "merged_compact.xlsx"
             resolved = root / "merged_resolved.xlsx"
             lookup = root / "merged_resolved_lookup.xlsx"
             manifest_path = root / "merged.manifest.json"
             self.assertTrue(merged.exists())
+            self.assertTrue(compact.exists())
             self.assertTrue(resolved.exists())
             self.assertTrue(lookup.exists())
             self.assertTrue(manifest_path.exists())
@@ -1078,7 +1108,11 @@ class OfflineMergeTests(unittest.TestCase):
             self.assertEqual(manifest["mode"], "offline_merge")
             self.assertEqual(manifest["input_rows"], 3)
             self.assertEqual(manifest["duplicates_removed"], 1)
+            self.assertEqual(Path(manifest["compact"]["output"]).resolve(), compact.resolve())
+            self.assertEqual(manifest["compact"]["removed_columns"], ["Plugin ID"])
             self.assertEqual(Path(manifest["resolved"]["output"]).resolve(), resolved.resolve())
+            self.assertEqual(manifest["resolved"]["source_file"], "merged_compact.xlsx")
+            self.assertTrue(manifest["resolved"]["see_also_removed"])
             self.assertEqual(Path(manifest["resolved"]["lookup_output"]).resolve(), lookup.resolve())
             self.assertEqual(manifest["resolved"]["lookup_rows"], 2)
             lookup_rows = read_xlsx(lookup)
@@ -1094,7 +1128,10 @@ class OfflineMergeTests(unittest.TestCase):
                                 for row in lookup_rows[1:]))
             resolved_rows = read_xlsx(resolved)
             resolved_header = resolved_rows[0]
-            self.assertEqual(resolved_header[resolved_header.index("See Also") + 1], "References")
+            self.assertNotIn("Plugin ID", read_xlsx(compact)[0])
+            self.assertNotIn("Plugin ID", resolved_header)
+            self.assertNotIn("See Also", resolved_header)
+            self.assertIn("References", resolved_header)
             references_index = resolved_header.index("References")
             self.assertEqual({row[references_index] for row in resolved_rows[1:]}, {
                 "https://existing.test", "https://example.test",
@@ -1109,6 +1146,7 @@ class OfflineMergeTests(unittest.TestCase):
                 self.assertEqual(main(["merge", "--folder", str(root)]), 0)
                 load_config.assert_not_called()
             self.assertEqual(len(read_xlsx(merged)), 3)
+            self.assertEqual(len(read_xlsx(compact)), 3)
             self.assertEqual(len(read_xlsx(resolved)), 3)
             self.assertEqual(len(read_xlsx(lookup)), 3)
 
